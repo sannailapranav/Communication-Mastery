@@ -1,0 +1,6 @@
+{
+  "name": "Communication Mastery",
+  "description": "A serious, game-like communication training platform teaching how to think, structure, and give strong answers in any situation.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
