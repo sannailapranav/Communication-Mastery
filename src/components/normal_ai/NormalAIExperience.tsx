@@ -23,7 +23,13 @@ import {
   Square,
   Globe,
   ExternalLink,
-  Pencil
+  Pencil,
+  Sparkles,
+  ChevronDown,
+  Loader2,
+  CheckCircle2,
+  CircleDashed,
+  Brain
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { NormalAiConversation, NormalAiMessage } from '../../types';
@@ -74,6 +80,14 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editInputText, setEditInputText] = useState<string>('');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [expandedReasoningMsgIds, setExpandedReasoningMsgIds] = useState<Record<string, boolean>>({});
+
+  const toggleReasoning = (msgId: string) => {
+    setExpandedReasoningMsgIds(prev => ({
+      ...prev,
+      [msgId]: prev[msgId] === undefined ? false : !prev[msgId]
+    }));
+  };
 
   // Long-press and context menu state for conversation deletion
   const [contextMenuConv, setContextMenuConv] = useState<{
@@ -94,6 +108,8 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const selectedConvIdRef = useRef<string | null>(null);
+  const activeRequestSeqRef = useRef<number>(0);
 
   const showToast = (text: string) => {
     setToastMessage(text);
@@ -134,25 +150,33 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
   };
 
   const selectConversation = async (convId: string) => {
+    const seq = ++activeRequestSeqRef.current;
+    selectedConvIdRef.current = convId;
     setActiveConversationId(convId);
     setIsLoading(false);
     setEditingMessageId(null);
     try {
       const data = await api.getConversation(convId);
-      setMessages(data.messages || []);
+      // Guard against stale async responses restoring messages for an unselected or deleted conversation
+      if (seq === activeRequestSeqRef.current && selectedConvIdRef.current === convId) {
+        setMessages(data.messages || []);
+      }
     } catch (err: any) {
       if (err?.status === 401) return;
       console.warn('Could not get conversation:', err?.message || err);
     } finally {
-      setIsSidebarOpen(false);
+      if (seq === activeRequestSeqRef.current) {
+        setIsSidebarOpen(false);
+      }
     }
   };
 
   const createNewConversation = async () => {
     try {
       const newConv = await api.createConversation();
-      setConversations(prev => [newConv, ...prev]);
+      setConversations(prev => [newConv, ...prev.filter(c => c.id !== newConv.id)]);
       setActiveConversationId(newConv.id);
+      selectedConvIdRef.current = newConv.id;
       setMessages([]);
       setEditingMessageId(null);
       setIsSidebarOpen(false);
@@ -167,26 +191,39 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
     setConvToDelete(null);
     setContextMenuConv(null);
 
-    // Optimistic removal from conversations list immediately
-    const remaining = conversations.filter(c => c.id !== convId);
-    setConversations(remaining);
-
-    if (activeConversationId === convId) {
-      if (remaining.length > 0) {
-        selectConversation(remaining[0].id);
-      } else {
-        createNewConversation();
-      }
+    // If active conversation is being deleted, abort any active streaming response
+    if (activeConversationId === convId && abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      setIsLoading(false);
     }
 
     try {
+      // 1. Wait for delete API request to succeed first
       await api.deleteConversation(convId);
+
+      // 2. Fetch fresh synchronized list from server
+      const freshList = await api.getConversations();
+      setConversations(freshList);
+
+      // 3. If the deleted conversation was active:
+      if (activeConversationId === convId) {
+        if (freshList.length > 0) {
+          // Select next available conversation after deletion succeeds
+          await selectConversation(freshList[0].id);
+        } else {
+          // Create new conversation only after deletion succeeds if none remain
+          await createNewConversation();
+        }
+      }
       showToast('Conversation deleted');
     } catch (err) {
       console.error('Failed to delete conversation:', err);
-      // Revert if severe failure
-      loadConversations();
       showToast('Failed to delete conversation');
+      try {
+        const freshList = await api.getConversations();
+        setConversations(freshList);
+      } catch (_) {}
     }
   };
 
@@ -325,6 +362,7 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
         },
         {
           onStart: (data) => {
+            if (controller.signal.aborted) return;
             setMessages(prev => {
               let updated = prev;
               if (data.removedMessageIds && data.removedMessageIds.length > 0) {
@@ -333,7 +371,22 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
               return updated.map(m => (m.id === tempUserMsgId ? data.userMessage : m));
             });
           },
+          onStep: (step) => {
+            if (controller.signal.aborted) return;
+            setMessages(prev =>
+              prev.map(m => {
+                if (m.id !== tempAssistantMsgId) return m;
+                const existing = m.reasoningSteps || [];
+                const idx = existing.findIndex(s => s.id === step.id);
+                const updated = idx >= 0
+                  ? existing.map((s, i) => (i === idx ? step : s))
+                  : [...existing, step];
+                return { ...m, reasoningSteps: updated };
+              })
+            );
+          },
           onDelta: (chunkText) => {
+            if (controller.signal.aborted) return;
             accumulatedAssistantText += chunkText;
             setMessages(prev =>
               prev.map(m =>
@@ -344,6 +397,7 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
             );
           },
           onDone: (data) => {
+            if (controller.signal.aborted) return;
             setMessages(prev =>
               prev.map(m =>
                 m.id === tempAssistantMsgId ? data.assistantMessage : m
@@ -367,24 +421,28 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
             }
           },
           onError: (err) => {
+            if (controller.signal.aborted || (err as any)?.name === 'AbortError') return;
             console.error('Stream error callback:', err);
           }
         },
         controller.signal
       );
     } catch (err: any) {
-      if (err?.name === 'AbortError') {
-        // User clicked Stop / Pause
-        setMessages(prev =>
-          prev.map(m =>
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        // User clicked Stop
+        setMessages(prev => {
+          if (!accumulatedAssistantText.trim()) {
+            return prev.filter(m => m.id !== tempAssistantMsgId);
+          }
+          return prev.map(m =>
             m.id === tempAssistantMsgId
               ? {
                   ...m,
-                  content: accumulatedAssistantText || '(Response paused by user)'
+                  content: accumulatedAssistantText
                 }
               : m
-          )
-        );
+          );
+        });
         return;
       }
       console.error('Message stream error:', err);
@@ -819,8 +877,85 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
                       ) : (
                         /* AI BUBBLE CONTENT & ACTIONS */
                         <>
-                          {/* If content is still empty and currently loading, show smooth bounce dots */}
-                          {!msg.content && isLoading && isLatestMessage ? (
+                          {/* Visible Research & Reasoning Steps Accordion (ChatGPT & Gemini style) */}
+                          {msg.reasoningSteps && msg.reasoningSteps.length > 0 && (() => {
+                            const isExpanded = expandedReasoningMsgIds[msg.id] !== undefined
+                              ? expandedReasoningMsgIds[msg.id]
+                              : (isLoading && isLatestMessage);
+                            const hasActiveStep = msg.reasoningSteps.some(s => s.status === 'in_progress');
+                            const activeStep = msg.reasoningSteps.find(s => s.status === 'in_progress') || msg.reasoningSteps[msg.reasoningSteps.length - 1];
+
+                            return (
+                              <div className="mb-3 rounded-xl border border-zinc-200/90 bg-zinc-50/70 overflow-hidden text-xs transition-all shadow-2xs">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleReasoning(msg.id)}
+                                  className="w-full px-3 py-2 flex items-center justify-between text-zinc-700 hover:text-zinc-950 hover:bg-zinc-100/70 transition-colors cursor-pointer text-left"
+                                >
+                                  <div className="flex items-center gap-2 font-medium min-w-0">
+                                    <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                    <span className="truncate">
+                                      {isLoading && isLatestMessage && hasActiveStep
+                                        ? (activeStep?.label || 'Deep Researching...')
+                                        : `Deep Research (${msg.reasoningSteps.length} step${msg.reasoningSteps.length > 1 ? 's' : ''})`}
+                                    </span>
+                                    {isLoading && isLatestMessage && hasActiveStep && (
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse shrink-0" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                                    <span className="text-[10px] text-zinc-400 font-mono">
+                                      {isExpanded ? 'Hide' : 'Show steps'}
+                                    </span>
+                                    <ChevronDown
+                                      className={`w-3.5 h-3.5 text-zinc-400 transition-transform duration-200 ${
+                                        isExpanded ? 'rotate-180' : ''
+                                      }`}
+                                    />
+                                  </div>
+                                </button>
+
+                                {isExpanded && (
+                                  <div className="px-3 pb-2.5 pt-1.5 border-t border-zinc-200/60 space-y-2 bg-white/60">
+                                    {msg.reasoningSteps.map((step) => {
+                                      const isDone = step.status === 'completed';
+                                      const isInProgress = step.status === 'in_progress';
+                                      return (
+                                        <div key={step.id} className="flex items-start gap-2 text-[11px] leading-relaxed">
+                                          <div className="pt-0.5 shrink-0">
+                                            {isDone ? (
+                                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                            ) : isInProgress ? (
+                                              <Loader2 className="w-3.5 h-3.5 text-amber-600 animate-spin" />
+                                            ) : (
+                                              <CircleDashed className="w-3.5 h-3.5 text-zinc-300" />
+                                            )}
+                                          </div>
+                                          <div className="flex-1 min-w-0">
+                                            <div className={`font-medium ${
+                                              isDone
+                                                ? 'text-zinc-700'
+                                                : isInProgress
+                                                ? 'text-zinc-950 font-semibold'
+                                                : 'text-zinc-400'
+                                            }`}>
+                                              {step.label}
+                                            </div>
+                                            {step.detail && (
+                                              <p className="text-[10px] text-zinc-500 mt-0.5">{step.detail}</p>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
+
+                          {/* If content is still empty and currently loading, and no reasoning steps yet, show smooth bounce dots */}
+                          {!msg.content && isLoading && isLatestMessage && (!msg.reasoningSteps || msg.reasoningSteps.length === 0) ? (
                             <div className="flex items-center gap-2 py-1 text-zinc-500 text-xs">
                               <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" />
                               <span
@@ -832,10 +967,10 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
                                 style={{ animationDelay: '300ms' }}
                               />
                               <span className="ml-1 text-[11px] font-mono text-zinc-500">
-                                Thinking & Searching...
+                                Connecting to Sākshi...
                               </span>
                             </div>
-                          ) : (
+                          ) : msg.content ? (
                             <div className="whitespace-pre-wrap">
                               {msg.content}
                               {/* Pulsing cursor while tokens are actively streaming */}
@@ -843,7 +978,7 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
                                 <span className="inline-block w-1.5 h-4 ml-0.5 bg-zinc-500 animate-pulse align-middle" />
                               )}
                             </div>
-                          )}
+                          ) : null}
 
                           {/* Google Search Grounding Sources / Citations */}
                           {msg.groundingSources && msg.groundingSources.length > 0 && (
@@ -991,7 +1126,7 @@ export const NormalAIExperience: React.FC<NormalAIExperienceProps> = ({
 
             <div className="flex items-center justify-between text-[10px] text-zinc-400 px-2 pt-2">
               <span>Press Enter to send · Shift+Enter for newline</span>
-              <span>Say "English lo matladu" or "Telugu lo matladu" anytime</span>
+              <span>Fast direct response · Type "deep research" for in-depth analysis</span>
             </div>
           </div>
         </div>

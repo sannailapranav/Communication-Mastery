@@ -38,7 +38,8 @@ import {
   rateLimitAiGeneration,
   rateLimitMentorConverse,
   rateLimitProgression,
-  rateLimitAuth
+  rateLimitAuth,
+  rateLimitSessionSync
 } from './src/utils/security';
 
 dotenv.config();
@@ -158,6 +159,8 @@ export interface DBUserLevelProgress {
   startedAt?: string;
   completedAt?: string;
   score?: number;
+  answers?: Record<number, string>;
+  createdAt?: string;
   updatedAt: string;
 }
 
@@ -256,12 +259,22 @@ export interface GroundingSource {
   uri: string;
 }
 
+export interface ReasoningStep {
+  id: string;
+  label: string;
+  detail?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  timestamp?: number;
+}
+
 export interface DBAiMessage {
   id: string;
   conversationId: string;
   userId: string;
   role: 'user' | 'model';
   content: string;
+  modelUsed?: string;
+  reasoningSteps?: ReasoningStep[];
   groundingSources?: GroundingSource[];
   webSearchQueries?: string[];
   createdAt: string;
@@ -288,7 +301,8 @@ interface DatabaseSchema {
   userAIFeedback: DBUserAIFeedback[];
 }
 
-function seedCurriculumTables(database: DatabaseSchema) {
+function seedCurriculumTables(database: DatabaseSchema): boolean {
+  let changed = false;
   const now = new Date().toISOString();
 
   // 1. Seed stages if empty or count changed
@@ -305,6 +319,7 @@ function seedCurriculumTables(database: DatabaseSchema) {
       colorTheme: s.colorTheme || 'amber',
       createdAt: now
     }));
+    changed = true;
   }
 
   // 2. Seed levels, sections, and exercises if empty or count changed (75 levels)
@@ -391,6 +406,7 @@ function seedCurriculumTables(database: DatabaseSchema) {
         createdAt: now
       });
     }
+    changed = true;
   }
 
   // 3. Migrate any legacy journeyProgress into relational userLevelProgress, userAnswers, and userAIFeedback
@@ -412,6 +428,7 @@ function seedCurriculumTables(database: DatabaseSchema) {
           score: legacy.score,
           updatedAt: now
         });
+        changed = true;
 
         if (legacy.answers) {
           for (const [qNumStr, ansText] of Object.entries(legacy.answers)) {
@@ -429,6 +446,7 @@ function seedCurriculumTables(database: DatabaseSchema) {
               answerText: ansText,
               submittedAt: legacy.completedAt || now
             });
+            changed = true;
           }
         }
 
@@ -451,11 +469,16 @@ function seedCurriculumTables(database: DatabaseSchema) {
             oneKeyPrinciple: legacy.evaluation.oneKeyPrinciple || '',
             createdAt: legacy.completedAt || now
           });
+          changed = true;
         }
       }
     }
   }
+
+  return changed;
 }
+
+let lastSavedSerialized = '';
 
 function initDb(): DatabaseSchema {
   if (!fs.existsSync(DATA_DIR)) {
@@ -463,6 +486,7 @@ function initDb(): DatabaseSchema {
   }
 
   let dbInstance: DatabaseSchema;
+  let isNewDb = false;
 
   if (fs.existsSync(STORE_PATH)) {
     try {
@@ -470,6 +494,7 @@ function initDb(): DatabaseSchema {
       dbInstance = JSON.parse(data);
     } catch {
       console.warn('Failed to parse store.json, reinitializing.');
+      isNewDb = true;
       dbInstance = {
         users: [],
         lessonProgress: [],
@@ -490,6 +515,7 @@ function initDb(): DatabaseSchema {
       };
     }
   } else {
+    isNewDb = true;
     dbInstance = {
       users: [],
       lessonProgress: [],
@@ -511,6 +537,11 @@ function initDb(): DatabaseSchema {
   }
 
   // Ensure arrays exist
+  if (!dbInstance.users) dbInstance.users = [];
+  if (!dbInstance.lessonProgress) dbInstance.lessonProgress = [];
+  if (!dbInstance.practiceAttempts) dbInstance.practiceAttempts = [];
+  if (!dbInstance.scoreEvents) dbInstance.scoreEvents = [];
+  if (!dbInstance.userAchievements) dbInstance.userAchievements = [];
   if (!dbInstance.aiConversations) dbInstance.aiConversations = [];
   if (!dbInstance.aiMessages) dbInstance.aiMessages = [];
   if (!dbInstance.journeyProgress) dbInstance.journeyProgress = [];
@@ -523,10 +554,14 @@ function initDb(): DatabaseSchema {
   if (!dbInstance.userAIFeedback) dbInstance.userAIFeedback = [];
 
   // Seed relational tables and migrate legacy records
-  seedCurriculumTables(dbInstance);
+  const changed = seedCurriculumTables(dbInstance);
 
   try {
-    fs.writeFileSync(STORE_PATH, JSON.stringify(dbInstance, null, 2), 'utf-8');
+    const serialized = JSON.stringify(dbInstance, null, 2);
+    if (isNewDb || changed) {
+      fs.writeFileSync(STORE_PATH, serialized, 'utf-8');
+    }
+    lastSavedSerialized = serialized;
   } catch (err) {
     console.error('Failed to write initial db:', err);
   }
@@ -538,9 +573,14 @@ const db: DatabaseSchema = initDb();
 
 function saveDb() {
   try {
+    const serialized = JSON.stringify(db, null, 2);
+    if (serialized === lastSavedSerialized) {
+      return;
+    }
     const tempPath = `${STORE_PATH}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(db, null, 2), 'utf-8');
+    fs.writeFileSync(tempPath, serialized, 'utf-8');
     fs.renameSync(tempPath, STORE_PATH);
+    lastSavedSerialized = serialized;
   } catch (err) {
     console.error('Failed to save store.json:', err);
   }
@@ -549,23 +589,256 @@ function saveDb() {
 // Lazy initialization of Gemini client
 let geminiClient: GoogleGenAI | null = null;
 const GEMINI_CANDIDATE_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-2.5-flash',
   'gemini-3.1-flash-lite',
-  'gemini-3.8-flash',
-  'gemini-flash-latest'
+  'gemini-flash-latest',
+  'gemini-3.8-flash'
 ];
+
+// Track temporarily degraded/overloaded models (503/429/high demand/quota)
+const modelCooldowns: Record<string, number> = {};
+
+function getActiveCandidateModels(): string[] {
+  const now = Date.now();
+  const healthy = GEMINI_CANDIDATE_MODELS.filter(m => (modelCooldowns[m] || 0) <= now);
+  if (healthy.length > 0) {
+    const degraded = GEMINI_CANDIDATE_MODELS.filter(m => (modelCooldowns[m] || 0) > now);
+    return [...healthy, ...degraded];
+  }
+  return [...GEMINI_CANDIDATE_MODELS];
+}
+
+function recordModelError(model: string, err: any) {
+  const errStr = ((err?.message || '') + ' ' + (err?.status || '')).toLowerCase();
+  const isDailyQuota =
+    errStr.includes('per_day') ||
+    errStr.includes('daily') ||
+    (errStr.includes('quota exceeded') && errStr.includes('retry in'));
+
+  const isTransientOrOverloaded =
+    err?.status === 503 ||
+    err?.status === 429 ||
+    errStr.includes('503') ||
+    errStr.includes('429') ||
+    errStr.includes('high demand') ||
+    errStr.includes('overloaded') ||
+    errStr.includes('resource_exhausted') ||
+    errStr.includes('unavailable') ||
+    errStr.includes('quota');
+
+  if (isDailyQuota) {
+    // Put model on cooldown for 12 hours so other models are prioritized
+    modelCooldowns[model] = Date.now() + 12 * 60 * 60 * 1000;
+    console.log(`[Gemini Model Cooldown] Daily quota reached on ${model}. Prioritizing other models for 12h.`);
+  } else if (isTransientOrOverloaded) {
+    // Put model on cooldown for 3 minutes to skip it in immediate subsequent calls
+    modelCooldowns[model] = Date.now() + 3 * 60 * 1000;
+  }
+}
 
 // Timestamp until which Google Search Grounding is bypassed due to 429 quota exhaustion
 let searchGroundingDisabledUntil = 0;
 
+// Requirement 1 & 3: Run Deep Research and search tools ONLY when explicitly requested
+function isExplicitDeepResearchRequested(userMessage: string): boolean {
+  const clean = (userMessage || '').toLowerCase();
+  const deepResearchKeywords = [
+    'deep research',
+    'thorough search',
+    'analyze in depth',
+    'in-depth analysis',
+    'deep dive research',
+    'conduct deep research',
+    'thorough research',
+    'deep research on',
+    'deeply research',
+    'deep dive into'
+  ];
+  return deepResearchKeywords.some(kw => clean.includes(kw));
+}
+
 function shouldEnableGoogleSearch(userText: string): boolean {
   if (Date.now() < searchGroundingDisabledUntil) return false;
-  const text = (userText || '').toLowerCase();
-  const searchTriggers = [
-    'search', 'google it', 'look up', 'latest news', 'current price', 'today', 'weather',
-    'who won', 'recent release', 'browse the web', 'sources', 'cite sources', 'live score',
-    'election', 'stock price', 'breaking news', 'what happened', 'search web', 'real-time'
+  const text = (userText || '').toLowerCase().trim();
+
+  // If user explicitly asks for Deep Research, enable search grounding
+  if (isExplicitDeepResearchRequested(userText)) {
+    return true;
+  }
+
+  // Strictly requested search queries ONLY (explicit search intent from user)
+  // For all normal conversational messages, knowledge queries (books, concepts, psychology), and chat,
+  // do NOT attach search tools so the model streams directly with zero latency.
+  const strictlyRequestedSearch = [
+    'search google',
+    'google search',
+    'search the web',
+    'browse the web',
+    'search online',
+    'lookup online',
+    'look up online',
+    'live web search',
+    'check latest 2026 news',
+    'search internet',
+    'search web'
   ];
-  return searchTriggers.some(trigger => text.includes(trigger));
+
+  return strictlyRequestedSearch.some(trigger => text.includes(trigger));
+}
+
+function isInstantGreeting(userText: string, hasContext: boolean): boolean {
+  if (hasContext) return false;
+  const clean = (userText || '').trim().toLowerCase();
+  if (!clean) return true;
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length > 5) return false;
+
+  // Real question triggers must never be treated as instant static greetings
+  const questionTriggers = [
+    'star', 'prep', 'pyramid', 'framework', 'formula', 'explain', 'what is', 'how to',
+    'interview', 'exam', 'protocol', 'sliding window', 'code', 'review', 'feedback',
+    'check', 'solve', 'help', 'write', 'difference', 'vs', 'why', 'meaning', 'tell me about',
+    'critique', 'correct', 'analyze', 'tips', 'technique', 'study'
+  ];
+  if (questionTriggers.some(t => clean.includes(t))) {
+    return false;
+  }
+
+  const greetingMatches = [
+    'hi', 'hello', 'hey', 'heyy', 'hii', 'hiii', 'hlo', 'namaste', 'namaskaram',
+    'good morning', 'good evening', 'good afternoon', 'good night',
+    'how are you', 'how r u', 'ela unnav', 'ela unnaru', 'kya haal hai', 'how do you do',
+    'sup', 'whats up', "what's up", 'wassup', 'yo',
+    'who are you', 'what is your name', 'nee peru enti', 'who made you',
+    'thanks', 'thank you', 'tq', 'dhanyavadalu', 'shukriya',
+    'ok', 'okay', 'cool', 'got it', 'sure', 'fine', 'great', 'awesome', 'nice',
+    'bye', 'see you', 'tata', 'gm', 'gn'
+  ];
+
+  if (greetingMatches.some(p => clean === p || clean.startsWith(p + ' ') || clean.endsWith(' ' + p))) {
+    return true;
+  }
+  if (words.length <= 4 && /^(hi|hello|hey|heyy|namaste|hlo|yo|ok|okay|thanks|thank|ela|kya|sup)/i.test(words[0])) {
+    return true;
+  }
+  return false;
+}
+
+function getInstantGreetingText(userText: string, activeLanguage: string): string {
+  const clean = (userText || '').trim().toLowerCase();
+  const isTenglish = activeLanguage.includes('Telugu') || /(undhi|cheyyi|ela|avuthundhi|cheppali|kavali|matladu|enti|chudu|leka|chesuko|namaskaram)/i.test(clean);
+  const isHindi = activeLanguage.includes('Hindi') || /(kya|haal|hai|kaise|ho|shukriya|namaste|batao|karein)/i.test(clean);
+
+  if (isTenglish) {
+    if (/(ela\s+unnav|ela\s+unnaru|how\s+are\s+you|how\s+r\s+u)/i.test(clean)) {
+      return "Hey! Nenu chala bagunnanu, thank you! Nuvvu ela unnav? Eeroju college or communication practice lo em discuss cheddham?";
+    }
+    if (/(who\s+are\s+you|nee\s+peru\s+enti|what\s+is\s+your\s+name)/i.test(clean)) {
+      return "Nenu Sākshi (సాక్షి)! Mee personal communication mentor and AI companion. Eeroju em explore cheddham?";
+    }
+    if (/(thanks|thank\s+you|tq|dhanyavadalu)/i.test(clean)) {
+      return "Most welcome! Ee time lo aina practice cheyyali anukunte nenu ikkade untanu. All the best!";
+    }
+    if (/(bye|see\s+you|tata)/i.test(clean)) {
+      return "Bye! Take care and practice continue cheyyi. Have a great day!";
+    }
+    return "Hey! Namaskaram! Ela unnav? Eeroju em practice cheddham—interview questions, daily communication, or framework exercises?";
+  }
+
+  if (isHindi) {
+    if (/(kya\s+haal|kaise\s+ho|how\s+are\s+you|how\s+r\s+u)/i.test(clean)) {
+      return "Hey! Main bilkul badhiya hoon, thank you! Aap bataiye kaise hain? Aaj kya discuss karein?";
+    }
+    if (/(who\s+are\s+you|naam\s+kya\s+hai|what\s+is\s+your\s+name)/i.test(clean)) {
+      return "Main Sākshi hoon, aapki communication mentor aur AI companion. Bataiye, aaj kis topic par baat karein?";
+    }
+    if (/(thanks|thank\s+you|shukriya|dhanyawad)/i.test(clean)) {
+      return "Aapka bahut swagat hai! Kabhi bhi koi sawal ho ya practice karni ho, pooch lena.";
+    }
+    if (/(bye|see\s+you|alvida)/i.test(clean)) {
+      return "Bye! Apna khayal rakhna aur practice jaari rakhna. Have a great day!";
+    }
+    return "Namaste! Kaise hain aap? Aaj kis cheez ki practice karni hai—frameworks, public speaking ya college prep?";
+  }
+
+  // English default
+  if (/(how\s+are\s+you|how\s+r\s+u)/i.test(clean)) {
+    return "Hey there! I'm doing great, thank you for asking! How are you doing today? What's on your mind?";
+  }
+  if (/(who\s+are\s+you|what\s+is\s+your\s+name)/i.test(clean)) {
+    return "I'm Sākshi, your communication mentor and conversational companion! I'm here to help you practice frameworks, prepare for discussions, or talk through any topic.";
+  }
+  if (/(thanks|thank\s+you|tq)/i.test(clean)) {
+    return "You're very welcome! Whenever you want to refine a pitch, practice a framework, or chat, I'm right here.";
+  }
+  if (/(bye|see\s+you|good\s+night|cya)/i.test(clean)) {
+    return "Take care and keep up the great momentum! Wishing you a wonderful day ahead!";
+  }
+  if (/(good\s+morning|morning|gm)/i.test(clean)) {
+    return "Good morning! Hope you're having an energized start to the day. What can we tackle together?";
+  }
+  if (/(good\s+evening|evening)/i.test(clean)) {
+    return "Good evening! How was your day? Ready to review a concept or do a quick practice round?";
+  }
+  return "Hey there! Great to see you. How is your day going? What can I help you practice or explore today?";
+}
+
+function isCasualUserMessage(userText: string, hasContext: boolean): boolean {
+  if (hasContext) return false;
+  const clean = (userText || '').trim().toLowerCase();
+  if (!clean) return true;
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length > 7) return false;
+
+  const casualPhrases = [
+    'hi', 'hello', 'hey', 'heyy', 'hii', 'hiii', 'hlo', 'namaste', 'namaskaram',
+    'good morning', 'good evening', 'good afternoon', 'good night',
+    'how are you', 'how r u', 'ela unnav', 'ela unnaru', 'kya haal hai', 'how do you do',
+    'sup', 'whats up', "what's up", 'wassup', 'yo',
+    'who are you', 'what is your name', 'nee peru enti', 'who made you',
+    'thanks', 'thank you', 'tq', 'dhanyavadalu', 'shukriya',
+    'ok', 'okay', 'cool', 'got it', 'sure', 'fine', 'great', 'awesome', 'nice',
+    'bye', 'see you', 'tata'
+  ];
+
+  if (casualPhrases.includes(clean)) return true;
+  if (words.length <= 4 && /^(hi|hello|hey|heyy|namaste|hlo|yo|ok|okay|thanks|thank)/i.test(words[0])) {
+    return true;
+  }
+  return false;
+}
+
+function determineInitialReasoningSteps(userMessage: string, context?: any, isCasual?: boolean): ReasoningStep[] {
+  // Requirement 1 & 2: Disable Automatic Deep Research & Synthetic Thought Delays.
+  // Run Deep Research ONLY if the user explicitly types keywords like "deep research", "thorough search", or "analyze in depth".
+  // For all general questions, knowledge queries (e.g., books, concepts, psychology), frameworks, and chat,
+  // completely disable multi-step reasoning simulation so the first token is sent immediately without artificial delay.
+  if (!isExplicitDeepResearchRequested(userMessage)) {
+    return [];
+  }
+
+  const now = Date.now();
+  return [
+    {
+      id: 'step-deep-plan',
+      label: 'Deep Research: Formulating multi-angle investigation plan...',
+      status: 'completed',
+      timestamp: now
+    },
+    {
+      id: 'step-deep-search',
+      label: 'Deep Research: Gathering verified sources & citations...',
+      status: 'in_progress',
+      timestamp: now
+    },
+    {
+      id: 'step-deep-synthesize',
+      label: 'Deep Research: Synthesizing comprehensive in-depth findings...',
+      status: 'pending',
+      timestamp: now
+    }
+  ];
 }
 
 function getGeminiClient(): GoogleGenAI | null {
@@ -610,7 +883,7 @@ async function generateContentSafe(
   }
 
   for (const config of configsToTry) {
-    for (const model of GEMINI_CANDIDATE_MODELS) {
+    for (const model of getActiveCandidateModels()) {
       try {
         return await client.models.generateContent({
           model,
@@ -619,36 +892,23 @@ async function generateContentSafe(
         });
       } catch (err: any) {
         lastError = err;
+        recordModelError(model, err);
+        const errStr = ((err?.message || '') + ' ' + (err?.status || '')).toLowerCase();
         const isQuotaOr429 =
           err?.status === 429 ||
-          err?.message?.includes('429') ||
-          err?.message?.includes('quota') ||
-          err?.message?.includes('RESOURCE_EXHAUSTED');
+          errStr.includes('429') ||
+          errStr.includes('quota') ||
+          errStr.includes('resource_exhausted');
 
         if (isQuotaOr429 && config.tools) {
-          console.warn('Google Search Grounding hit quota (429), disabling temporarily and retrying without tools...');
+          console.log('[Gemini Grounding] Search Grounding quota reached (429), retrying without tools...');
           searchGroundingDisabledUntil = Date.now() + 5 * 60 * 1000;
           break; // break to try config without tools
         }
 
-        const isTransient =
-          isQuotaOr429 ||
-          err?.status === 503 ||
-          err?.status === 404 ||
-          err?.status === 500 ||
-          err?.message?.includes('503') ||
-          err?.message?.includes('high demand') ||
-          err?.message?.includes('overloaded') ||
-          err?.message?.includes('resource_exhausted') ||
-          err?.message?.includes('UNAVAILABLE') ||
-          err?.message?.includes('not found');
-
-        if (isTransient) {
-          console.warn(`Model ${model} temporarily unavailable (${err?.status || 'transient'}), trying next candidate...`);
-          await new Promise(r => setTimeout(r, 60));
-          continue;
-        }
-        break;
+        console.log(`[Gemini Model Fallback] Model ${model} unavailable (${err?.status || 'retryable'}), rotating to next candidate...`);
+        await new Promise(r => setTimeout(r, 60));
+        continue;
       }
     }
   }
@@ -662,8 +922,14 @@ async function streamGeminiContentSafe(
     contents: any;
     config?: any;
   },
-  onChunk: (chunk: any, text: string) => Promise<void> | void
+  onChunk: (chunk: any, text: string) => Promise<void> | void,
+  onWebQuery?: (query: string) => Promise<void> | void,
+  abortSignal?: AbortSignal
 ): Promise<{ text: string; modelUsed: string; groundingSources: GroundingSource[]; webSearchQueries: string[] }> {
+  if (abortSignal?.aborted) {
+    return { text: '', modelUsed: '', groundingSources: [], webSearchQueries: [] };
+  }
+
   let lastError: any = null;
   const originalConfig = params.config || {};
   const hasTools = Boolean(originalConfig.tools && originalConfig.tools.length > 0);
@@ -682,22 +948,48 @@ async function streamGeminiContentSafe(
   }
 
   for (const config of configsToTry) {
-    for (const model of GEMINI_CANDIDATE_MODELS) {
+    if (abortSignal?.aborted) break;
+
+    for (const model of getActiveCandidateModels()) {
+      if (abortSignal?.aborted) break;
+
       let emittedAnyText = false;
       let accumulatedText = '';
       const groundingSources: GroundingSource[] = [];
       const webSearchQueries: string[] = [];
 
+      // Link candidate timeout (7.5s before first chunk) with parent abort signal
+      const candidateController = new AbortController();
+      let parentAbortListener: (() => void) | null = null;
+      if (abortSignal) {
+        parentAbortListener = () => candidateController.abort();
+        abortSignal.addEventListener('abort', parentAbortListener, { once: true });
+      }
+
+      const candidateTimeoutTimer = setTimeout(() => {
+        if (!emittedAnyText) {
+          candidateController.abort();
+        }
+      }, 7500);
+
       try {
         const stream = await client.models.generateContentStream({
           model,
           contents: params.contents,
-          config
+          config: {
+            ...config,
+            abortSignal: candidateController.signal
+          }
         });
 
         for await (const chunk of stream) {
+          if (abortSignal?.aborted) {
+            break;
+          }
+
           const chunkText = chunk.text || '';
           if (chunkText) {
+            clearTimeout(candidateTimeoutTimer);
             emittedAnyText = true;
             accumulatedText += chunkText;
             await onChunk(chunk, chunkText);
@@ -732,10 +1024,30 @@ async function streamGeminiContentSafe(
           if (groundingMetadata?.webSearchQueries && Array.isArray(groundingMetadata.webSearchQueries)) {
             for (const q of groundingMetadata.webSearchQueries) {
               if (typeof q === 'string' && q.trim() && !webSearchQueries.includes(q.trim())) {
-                webSearchQueries.push(q.trim());
+                const cleanQ = q.trim();
+                webSearchQueries.push(cleanQ);
+                try {
+                  await onWebQuery?.(cleanQ);
+                } catch {
+                  // ignore
+                }
               }
             }
           }
+        }
+
+        clearTimeout(candidateTimeoutTimer);
+        if (parentAbortListener && abortSignal) {
+          abortSignal.removeEventListener('abort', parentAbortListener);
+        }
+
+        if (abortSignal?.aborted) {
+          return {
+            text: accumulatedText,
+            modelUsed: model,
+            groundingSources,
+            webSearchQueries
+          };
         }
 
         if (accumulatedText.trim().length > 0) {
@@ -747,15 +1059,32 @@ async function streamGeminiContentSafe(
           };
         }
       } catch (err: any) {
+        clearTimeout(candidateTimeoutTimer);
+        if (parentAbortListener && abortSignal) {
+          abortSignal.removeEventListener('abort', parentAbortListener);
+        }
+
+        if (abortSignal?.aborted) {
+          // User requested stop - do not attempt fallbacks or other models
+          return {
+            text: accumulatedText,
+            modelUsed: model,
+            groundingSources,
+            webSearchQueries
+          };
+        }
+
         lastError = err;
+        recordModelError(model, err);
+        const errStr = ((err?.message || '') + ' ' + (err?.status || '')).toLowerCase();
         const isQuotaOr429 =
           err?.status === 429 ||
-          err?.message?.includes('429') ||
-          err?.message?.includes('quota') ||
-          err?.message?.includes('RESOURCE_EXHAUSTED');
+          errStr.includes('429') ||
+          errStr.includes('quota') ||
+          errStr.includes('resource_exhausted');
 
         if (isQuotaOr429 && config.tools) {
-          console.warn('Search Grounding quota exceeded (429), disabling temporarily and retrying without tools...');
+          console.log('[Gemini Safe Stream] Search Grounding quota reached (429), retrying without tools...');
           searchGroundingDisabledUntil = Date.now() + 5 * 60 * 1000;
           break; // Try config without tools
         }
@@ -770,11 +1099,15 @@ async function streamGeminiContentSafe(
           };
         }
 
-        // Otherwise, continue to next model
-        console.warn(`Streaming with model ${model} failed (${err?.status || 'error'}), trying next candidate...`);
+        // Otherwise, smoothly rotate to next available model without emitting to stderr
+        console.log(`[Gemini Safe Stream] Model ${model} temporarily unavailable (${err?.status || 'transient'}), rotating to next candidate...`);
         continue;
       }
     }
+  }
+
+  if (abortSignal?.aborted) {
+    return { text: '', modelUsed: '', groundingSources: [], webSearchQueries: [] };
   }
 
   throw lastError;
@@ -1120,11 +1453,16 @@ function checkAndAwardAchievements(userId: string): string[] {
 /**
  * Synchronize user's completed levels and progress into Supabase profiles and user_metadata
  */
+/**
+ * Synchronize user's completed level progress to Supabase
+ */
 async function syncUserProgressToSupabase(
   userId: string,
   userToken?: string,
   currentLevel?: number,
-  completedLevels?: number[]
+  completedLevels?: number[],
+  email?: string,
+  displayName?: string
 ) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
   try {
@@ -1137,15 +1475,23 @@ async function syncUserProgressToSupabase(
     const count = completedLevels ? completedLevels.length : 0;
     const levelToSet = currentLevel || (count + 1);
 
-    // 1. Update public.profiles table
-    await client
+    // 1. Upsert public.profiles table (strictly preserves existing account records)
+    const profilePayload: any = {
+      id: userId,
+      current_level: levelToSet,
+      xp: count * 100,
+      updated_at: now
+    };
+    if (email) profilePayload.email = email;
+    if (displayName) profilePayload.full_name = displayName;
+
+    const { error: profileErr } = await client
       .from('profiles')
-      .update({
-        current_level: levelToSet,
-        xp: count * 100,
-        updated_at: now
-      })
-      .eq('id', userId);
+      .upsert(profilePayload, { onConflict: 'id' });
+
+    if (profileErr) {
+      console.warn('[Supabase Sync] profiles upsert warning:', profileErr.message);
+    }
 
     // 2. Update user_metadata in Supabase Auth if token is available
     if (userToken) {
@@ -1159,101 +1505,414 @@ async function syncUserProgressToSupabase(
       });
     }
 
-    // 3. Upsert completed levels into public.user_level_progress table strictly enforcing RLS
+    // 3. Attempt upsert into public.user_level_progress table if table exists
     if (completedLevels && completedLevels.length > 0) {
-      const recordsToUpsert = completedLevels.map(lvl => ({
-        id: `ulp-${userId}-${lvl}`,
-        user_id: userId,
-        level_number: lvl,
-        status: 'COMPLETED',
-        updated_at: now
-      }));
-      await client
-        .from('user_level_progress')
-        .upsert(recordsToUpsert, { onConflict: 'id' });
+      try {
+        const recordsToUpsert = completedLevels.map(lvl => ({
+          id: `ulp-${userId}-${lvl}`,
+          user_id: userId,
+          level_number: lvl,
+          status: 'COMPLETED',
+          updated_at: now
+        }));
+        await client
+          .from('user_level_progress')
+          .upsert(recordsToUpsert, { onConflict: 'id' });
+      } catch (ulpErr) {
+        // user_level_progress table may not exist in remote Supabase schema cache; profiles table is primary
+      }
     }
   } catch (err) {
     console.warn('[Supabase Sync] Could not sync user progress to Supabase:', err);
   }
 }
 
+interface LocalClientProgress {
+  completedLevels?: number[];
+  levels?: Record<number, {
+    levelNumber: number;
+    status: JourneyLevelStatus;
+    score?: number;
+    currentStep?: number;
+    completedAt?: string;
+    answers?: Record<number, string>;
+  }>;
+  currentLevel?: number;
+  stats?: {
+    xp?: number;
+    streakDays?: number;
+  };
+}
+
+/**
+ * Two-way union progress merge on login:
+ * 1. Checks remote Supabase database for all completed levels & journey progress (by user ID & email).
+ * 2. Checks local database records across any accounts associated with this user / email.
+ * 3. Incorporates offline/guest progress from the client before logging in.
+ * 4. Performs a union/merge (keeps whichever progress level is higher, never downgrades or wipes records).
+ * 5. Consolidates progress onto targetUserId and syncs back to Supabase.
+ */
+async function performTwoWayProgressMerge(
+  targetUserId: string,
+  userEmail: string,
+  userToken?: string,
+  localProgress?: LocalClientProgress
+): Promise<JourneyStateSummary> {
+  const now = new Date().toISOString();
+
+  // 1. Identify all candidate user accounts in db.users associated with this user
+  const candidateUserIds = new Set<string>();
+  candidateUserIds.add(targetUserId);
+
+  const cleanEmail = (userEmail || '').trim().toLowerCase();
+  const emailPrefix = cleanEmail ? cleanEmail.split('@')[0].replace(/[0-9]/g, '') : '';
+
+  for (const u of db.users) {
+    if (u.id === targetUserId) continue;
+    const uCleanEmail = (u.email || '').trim().toLowerCase();
+    if (!uCleanEmail) continue;
+
+    if (uCleanEmail === cleanEmail) {
+      candidateUserIds.add(u.id);
+    } else if (emailPrefix && emailPrefix.length >= 6 && uCleanEmail.startsWith(emailPrefix)) {
+      candidateUserIds.add(u.id);
+    }
+  }
+
+  // 2. Collect completed levels and progress records across all candidate accounts in db
+  interface MergedLevelData {
+    levelNumber: number;
+    status: JourneyLevelStatus;
+    score: number;
+    currentStep: number;
+    exerciseStep: number;
+    mandatoryExercisesCompleted: number;
+    completedAt?: string;
+    answers?: Record<number, string>;
+  }
+
+  const mergedLevels: Map<number, MergedLevelData> = new Map();
+
+  for (const candidateId of candidateUserIds) {
+    const records = db.userLevelProgress.filter(p => p.userId === candidateId);
+    for (const rec of records) {
+      const existing = mergedLevels.get(rec.levelNumber);
+      const isCompleted = rec.status === 'COMPLETED';
+      const score = Math.max(rec.score || 0, existing?.score || 0, isCompleted ? 85 : 0);
+
+      if (!existing) {
+        mergedLevels.set(rec.levelNumber, {
+          levelNumber: rec.levelNumber,
+          status: rec.status,
+          score,
+          currentStep: rec.currentStep || (isCompleted ? 7 : 1),
+          exerciseStep: rec.exerciseStep || (isCompleted ? 3 : 1),
+          mandatoryExercisesCompleted: rec.mandatoryExercisesCompleted || (isCompleted ? 3 : 0),
+          completedAt: rec.completedAt,
+          answers: rec.answers
+        });
+      } else {
+        // Union merge: if ANY source completed the level, keep COMPLETED!
+        if (isCompleted || existing.status === 'COMPLETED') {
+          existing.status = 'COMPLETED';
+          existing.currentStep = 7;
+          existing.exerciseStep = 3;
+          existing.mandatoryExercisesCompleted = 3;
+        } else if (rec.status === 'IN_PROGRESS' || existing.status === 'IN_PROGRESS') {
+          existing.status = 'IN_PROGRESS';
+        }
+        existing.score = Math.max(existing.score, score);
+        existing.currentStep = Math.max(existing.currentStep, rec.currentStep || 1);
+        if (rec.completedAt && (!existing.completedAt || rec.completedAt > existing.completedAt)) {
+          existing.completedAt = rec.completedAt;
+        }
+        if (rec.answers) {
+          existing.answers = { ...(existing.answers || {}), ...rec.answers };
+        }
+      }
+    }
+  }
+
+  // 3. Query remote Supabase database for progress
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+    try {
+      const client = createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false },
+        global: userToken ? { headers: { Authorization: `Bearer ${userToken}` } } : undefined
+      });
+
+      // Check profiles by targetUserId
+      let remoteProfile: any = null;
+      const { data: pById } = await client.from('profiles').select('*').eq('id', targetUserId).maybeSingle();
+      if (pById) {
+        remoteProfile = pById;
+      } else if (cleanEmail) {
+        const { data: pByEmail } = await client.from('profiles').select('*').eq('email', cleanEmail).maybeSingle();
+        if (pByEmail) {
+          remoteProfile = pByEmail;
+        } else if (emailPrefix && emailPrefix.length >= 6) {
+          const { data: pList } = await client.from('profiles').select('*');
+          if (pList) {
+            const match = pList.find((p: any) => p.email && p.email.toLowerCase().startsWith(emailPrefix));
+            if (match) remoteProfile = match;
+          }
+        }
+      }
+
+      // Read current_level from remote profile: all levels < current_level are completed
+      if (remoteProfile && typeof remoteProfile.current_level === 'number' && remoteProfile.current_level > 1) {
+        for (let lvl = 1; lvl < remoteProfile.current_level; lvl++) {
+          const existing = mergedLevels.get(lvl);
+          if (!existing) {
+            mergedLevels.set(lvl, {
+              levelNumber: lvl,
+              status: 'COMPLETED',
+              score: 85,
+              currentStep: 7,
+              exerciseStep: 3,
+              mandatoryExercisesCompleted: 3,
+              completedAt: remoteProfile.updated_at || now
+            });
+          } else {
+            existing.status = 'COMPLETED';
+            existing.score = Math.max(existing.score, 85);
+            existing.currentStep = 7;
+            existing.exerciseStep = 3;
+            existing.mandatoryExercisesCompleted = 3;
+          }
+        }
+      }
+
+      // Check auth user_metadata if userToken exists
+      if (userToken) {
+        const { data: authUser } = await client.auth.getUser();
+        const metaLevels = authUser?.user?.user_metadata?.completed_levels;
+        if (Array.isArray(metaLevels)) {
+          for (const lvl of metaLevels) {
+            if (typeof lvl === 'number' && lvl >= 1 && lvl <= 75) {
+              const existing = mergedLevels.get(lvl);
+              if (!existing) {
+                mergedLevels.set(lvl, {
+                  levelNumber: lvl,
+                  status: 'COMPLETED',
+                  score: 85,
+                  currentStep: 7,
+                  exerciseStep: 3,
+                  mandatoryExercisesCompleted: 3,
+                  completedAt: now
+                });
+              } else {
+                existing.status = 'COMPLETED';
+                existing.score = Math.max(existing.score, 85);
+                existing.currentStep = 7;
+                existing.exerciseStep = 3;
+                existing.mandatoryExercisesCompleted = 3;
+              }
+            }
+          }
+        }
+      }
+    } catch (sbErr) {
+      console.warn('[Merge] Supabase read error (non-fatal):', sbErr);
+    }
+  }
+
+  // 4. Merge client local / offline guest progress
+  if (localProgress) {
+    if (Array.isArray(localProgress.completedLevels)) {
+      for (const lvl of localProgress.completedLevels) {
+        if (typeof lvl === 'number' && lvl >= 1 && lvl <= 75) {
+          const existing = mergedLevels.get(lvl);
+          if (!existing) {
+            mergedLevels.set(lvl, {
+              levelNumber: lvl,
+              status: 'COMPLETED',
+              score: 85,
+              currentStep: 7,
+              exerciseStep: 3,
+              mandatoryExercisesCompleted: 3,
+              completedAt: now
+            });
+          } else {
+            existing.status = 'COMPLETED';
+            existing.score = Math.max(existing.score, 85);
+            existing.currentStep = 7;
+            existing.exerciseStep = 3;
+            existing.mandatoryExercisesCompleted = 3;
+          }
+        }
+      }
+    }
+
+    if (localProgress.levels && typeof localProgress.levels === 'object') {
+      for (const [lvlStr, clientRec] of Object.entries(localProgress.levels)) {
+        const lvl = parseInt(lvlStr, 10);
+        if (isNaN(lvl) || lvl < 1 || lvl > 75) continue;
+        const existing = mergedLevels.get(lvl);
+        const isClientCompleted = clientRec.status === 'COMPLETED';
+
+        if (!existing) {
+          mergedLevels.set(lvl, {
+            levelNumber: lvl,
+            status: clientRec.status,
+            score: clientRec.score || (isClientCompleted ? 85 : 0),
+            currentStep: clientRec.currentStep || (isClientCompleted ? 7 : 1),
+            exerciseStep: isClientCompleted ? 3 : 1,
+            mandatoryExercisesCompleted: isClientCompleted ? 3 : 0,
+            completedAt: clientRec.completedAt || (isClientCompleted ? now : undefined),
+            answers: clientRec.answers
+          });
+        } else {
+          if (isClientCompleted || existing.status === 'COMPLETED') {
+            existing.status = 'COMPLETED';
+            existing.currentStep = 7;
+            existing.exerciseStep = 3;
+            existing.mandatoryExercisesCompleted = 3;
+          } else if (clientRec.status === 'IN_PROGRESS' || existing.status === 'IN_PROGRESS') {
+            existing.status = 'IN_PROGRESS';
+          }
+          if (typeof clientRec.score === 'number') {
+            existing.score = Math.max(existing.score, clientRec.score);
+          }
+          if (typeof clientRec.currentStep === 'number') {
+            existing.currentStep = Math.max(existing.currentStep, clientRec.currentStep);
+          }
+          if (clientRec.answers) {
+            existing.answers = { ...(existing.answers || {}), ...clientRec.answers };
+          }
+        }
+      }
+    }
+  }
+
+  // 5. Update db.userLevelProgress for targetUserId
+  const completedLevelsArray: number[] = [];
+  for (const [lvl, data] of mergedLevels.entries()) {
+    let rec = db.userLevelProgress.find(p => p.userId === targetUserId && p.levelNumber === lvl);
+    if (!rec) {
+      rec = {
+        id: `ulp-${targetUserId}-${lvl}`,
+        userId: targetUserId,
+        levelNumber: lvl,
+        status: data.status,
+        currentStep: data.currentStep,
+        exerciseStep: data.exerciseStep,
+        mandatoryExercisesCompleted: data.mandatoryExercisesCompleted,
+        score: data.score,
+        completedAt: data.completedAt,
+        answers: data.answers,
+        createdAt: now,
+        updatedAt: now
+      };
+      db.userLevelProgress.push(rec);
+    } else {
+      if (data.status === 'COMPLETED' || rec.status === 'COMPLETED') {
+        rec.status = 'COMPLETED';
+        rec.currentStep = 7;
+        rec.exerciseStep = 3;
+        rec.mandatoryExercisesCompleted = 3;
+      } else if (data.status === 'IN_PROGRESS' || rec.status === 'IN_PROGRESS') {
+        rec.status = 'IN_PROGRESS';
+        rec.currentStep = Math.max(rec.currentStep || 1, data.currentStep || 1);
+      }
+      rec.score = Math.max(rec.score || 0, data.score || 0);
+      if (data.completedAt && (!rec.completedAt || data.completedAt > rec.completedAt)) {
+        rec.completedAt = data.completedAt;
+      }
+      if (data.answers) {
+        rec.answers = { ...(rec.answers || {}), ...data.answers };
+      }
+      rec.updatedAt = now;
+    }
+
+    if (rec.status === 'COMPLETED') {
+      completedLevelsArray.push(lvl);
+    }
+  }
+
+  // 6. Migrate related records from other candidate IDs if different
+  for (const candidateId of candidateUserIds) {
+    if (candidateId === targetUserId) continue;
+
+    for (const a of db.userAnswers) {
+      if (a.userId === candidateId) a.userId = targetUserId;
+    }
+    for (const f of db.userAIFeedback) {
+      if (f.userId === candidateId) f.userId = targetUserId;
+    }
+    for (const lp of db.lessonProgress) {
+      if (lp.userId === candidateId) lp.userId = targetUserId;
+    }
+    for (const pa of db.practiceAttempts) {
+      if (pa.userId === candidateId) pa.userId = targetUserId;
+    }
+    for (const se of db.scoreEvents) {
+      if (se.userId === candidateId) se.userId = targetUserId;
+    }
+    for (const ach of db.userAchievements) {
+      if (ach.userId === candidateId) ach.userId = targetUserId;
+    }
+    db.userLevelProgress = db.userLevelProgress.filter(p => p.userId !== candidateId || p.userId === targetUserId);
+    db.users = db.users.filter(u => u.id !== candidateId || u.id === targetUserId);
+  }
+
+  // 7. Calculate current level (the lowest incomplete level)
+  completedLevelsArray.sort((a, b) => a - b);
+  let currentLevel = 1;
+  for (let lvl = 1; lvl <= 75; lvl++) {
+    const isComp = completedLevelsArray.includes(lvl);
+    if (!isComp) {
+      currentLevel = lvl;
+      break;
+    }
+    if (lvl === 75) currentLevel = 75;
+  }
+
+  // Ensure currentLevel is unlocked (AVAILABLE or IN_PROGRESS)
+  let currentRec = db.userLevelProgress.find(p => p.userId === targetUserId && p.levelNumber === currentLevel);
+  if (!currentRec) {
+    db.userLevelProgress.push({
+      id: `ulp-${targetUserId}-${currentLevel}`,
+      userId: targetUserId,
+      levelNumber: currentLevel,
+      status: 'AVAILABLE',
+      currentStep: 1,
+      createdAt: now,
+      updatedAt: now
+    });
+  } else if (currentRec.status === 'LOCKED') {
+    currentRec.status = 'AVAILABLE';
+    currentRec.updatedAt = now;
+  }
+
+  // 8. Save local database
+  saveDb();
+
+  // 9. Sync merged progress back to Supabase
+  const targetUser = db.users.find(u => u.id === targetUserId);
+  await syncUserProgressToSupabase(
+    targetUserId,
+    userToken,
+    currentLevel,
+    completedLevelsArray,
+    userEmail || targetUser?.email,
+    targetUser?.displayName
+  );
+
+  // 10. Generate and return fresh JourneyStateSummary
+  return getUserJourneyState(targetUserId);
+}
+
 /**
  * Hydrate user's completed level progress from Supabase if present
  */
-async function hydrateUserProgressFromSupabase(userId: string, userToken?: string) {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
-  try {
-    const client = createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      auth: { persistSession: false },
-      global: userToken ? { headers: { Authorization: `Bearer ${userToken}` } } : undefined
-    });
-
-    // Check public.profiles
-    const { data: profile } = await client
-      .from('profiles')
-      .select('current_level, xp')
-      .eq('id', userId)
-      .single();
-
-    // Check user_metadata
-    let completedLevelsFromMeta: number[] | undefined;
-    if (userToken) {
-      const { data: authUser } = await client.auth.getUser();
-      if (authUser?.user?.user_metadata?.completed_levels) {
-        completedLevelsFromMeta = authUser.user.user_metadata.completed_levels;
-      }
-    }
-
-    const currentLevelFromProfile = profile?.current_level || 1;
-    const now = new Date().toISOString();
-
-    if (Array.isArray(completedLevelsFromMeta) && completedLevelsFromMeta.length > 0) {
-      for (const lvl of completedLevelsFromMeta) {
-        const existing = db.userLevelProgress.find(p => p.userId === userId && p.levelNumber === lvl);
-        if (!existing) {
-          db.userLevelProgress.push({
-            id: `ulp-${userId}-${lvl}`,
-            userId,
-            levelNumber: lvl,
-            status: 'COMPLETED',
-            currentStep: 7,
-            score: 85,
-            completedAt: now,
-            updatedAt: now
-          });
-        } else if (existing.status !== 'COMPLETED') {
-          existing.status = 'COMPLETED';
-          existing.updatedAt = now;
-        }
-      }
-      saveDb();
-    } else if (currentLevelFromProfile > 1) {
-      for (let lvl = 1; lvl < currentLevelFromProfile; lvl++) {
-        const existing = db.userLevelProgress.find(p => p.userId === userId && p.levelNumber === lvl);
-        if (!existing) {
-          db.userLevelProgress.push({
-            id: `ulp-${userId}-${lvl}`,
-            userId,
-            levelNumber: lvl,
-            status: 'COMPLETED',
-            currentStep: 7,
-            score: 85,
-            completedAt: now,
-            updatedAt: now
-          });
-        } else if (existing.status !== 'COMPLETED') {
-          existing.status = 'COMPLETED';
-          existing.updatedAt = now;
-        }
-      }
-      saveDb();
-    }
-  } catch (err) {
-    console.warn('[Supabase Hydrate] Could not hydrate progress from Supabase:', err);
-  }
+async function hydrateUserProgressFromSupabase(userId: string, userToken?: string, email?: string) {
+  const user = db.users.find(u => u.id === userId);
+  await performTwoWayProgressMerge(userId, email || user?.email || '', userToken);
 }
 
 function getUserJourneyState(userId: string): JourneyStateSummary {
+  let hasDbChanges = false;
   // Ensure user has at least level 1 defined in relational userLevelProgress
   let userProgressList = db.userLevelProgress.filter(p => p.userId === userId);
 
@@ -1268,7 +1927,7 @@ function getUserJourneyState(userId: string): JourneyStateSummary {
       updatedAt: new Date().toISOString()
     };
     db.userLevelProgress.push(l1);
-    saveDb();
+    hasDbChanges = true;
     userProgressList = db.userLevelProgress.filter(p => p.userId === userId);
   }
 
@@ -1304,9 +1963,10 @@ function getUserJourneyState(userId: string): JourneyStateSummary {
         }
       : undefined;
 
-    const recordedScore = existing?.score ?? evalData?.overallScore;
-    const isPassing = recordedScore === undefined || recordedScore >= PASSING_SCORE;
-    const isCompleted = existing?.status === 'COMPLETED' && isPassing;
+    const isCompleted = existing?.status === 'COMPLETED';
+    const recordedScore = isCompleted
+      ? Math.max(existing?.score ?? evalData?.overallScore ?? 85, PASSING_SCORE)
+      : (existing?.score ?? evalData?.overallScore);
 
     let computedStatus: JourneyLevelStatus = 'LOCKED';
 
@@ -1344,7 +2004,7 @@ function getUserJourneyState(userId: string): JourneyStateSummary {
       if (existing.status !== computedStatus) {
         existing.status = computedStatus;
         existing.updatedAt = new Date().toISOString();
-        saveDb();
+        hasDbChanges = true;
       }
       levelsMap[lvl] = {
         levelNumber: lvl,
@@ -1367,7 +2027,7 @@ function getUserJourneyState(userId: string): JourneyStateSummary {
           updatedAt: new Date().toISOString()
         };
         db.userLevelProgress.push(newP);
-        saveDb();
+        hasDbChanges = true;
       }
       levelsMap[lvl] = {
         levelNumber: lvl,
@@ -1376,6 +2036,10 @@ function getUserJourneyState(userId: string): JourneyStateSummary {
     }
 
     prevLevelCompletedWithPassing = computedStatus === 'COMPLETED';
+  }
+
+  if (hasDbChanges) {
+    saveDb();
   }
 
   const completedCount = Object.values(levelsMap).filter(l => l.status === 'COMPLETED').length;
@@ -2269,7 +2933,7 @@ async function startServer() {
   });
 
   // Auth: Sync Supabase Authenticated User Identity
-  app.post('/api/auth/sync-supabase-user', rateLimitAuth, async (req, res) => {
+  app.post('/api/auth/sync-supabase-user', rateLimitSessionSync, async (req, res) => {
     try {
       const authHeader = req.headers.authorization;
       const token = authHeader && authHeader.split(' ')[1];
@@ -2307,7 +2971,18 @@ async function startServer() {
         }
       }
 
-      let user = db.users.find(u => u.id === sbUser.id || (sbUser.email && u.email.toLowerCase() === sbUser.email.toLowerCase()));
+      const sbEmail = (sbUser.email || '').trim().toLowerCase();
+      const emailPrefix = sbEmail ? sbEmail.split('@')[0].replace(/[0-9]/g, '') : '';
+
+      // Find user by ID, exact email, or matching email prefix (e.g. sannailapranav)
+      let user = db.users.find(u => {
+        if (u.id === sbUser.id) return true;
+        const uEmail = (u.email || '').trim().toLowerCase();
+        if (sbEmail && uEmail === sbEmail) return true;
+        if (emailPrefix && emailPrefix.length >= 6 && uEmail.startsWith(emailPrefix)) return true;
+        return false;
+      });
+
       let isNewUser = false;
 
       if (!user) {
@@ -2341,8 +3016,17 @@ async function startServer() {
         saveDb();
       } else {
         let changed = false;
+        const oldId = user.id;
         if (user.id !== sbUser.id) {
           user.id = sbUser.id;
+          changed = true;
+          // Reassign records from oldId to sbUser.id
+          for (const p of db.userLevelProgress) {
+            if (p.userId === oldId) p.userId = sbUser.id;
+          }
+        }
+        if (sbUser.email && !user.email) {
+          user.email = sbUser.email;
           changed = true;
         }
         if (sbUser.user_metadata?.avatar_url && !user.avatarUrl) {
@@ -2355,8 +3039,14 @@ async function startServer() {
         }
       }
 
-      // Restore user's completed level progress from Supabase if available
-      await hydrateUserProgressFromSupabase(user.id, token);
+      // Perform two-way progress merge on login:
+      // Union merge between local guest progress, remote Supabase DB, and local records
+      const journeyState = await performTwoWayProgressMerge(
+        user.id,
+        user.email,
+        token,
+        req.body?.localProgress
+      );
 
       res.json({
         user: {
@@ -2377,7 +3067,8 @@ async function startServer() {
           createdAt: user.createdAt,
           updatedAt: user.updatedAt
         },
-        isNewUser
+        isNewUser,
+        journeyState
       });
     } catch (err) {
       console.error('Error syncing Supabase user:', err);
@@ -2621,24 +3312,9 @@ async function startServer() {
   // List all Normal AI conversations for authenticated user
   app.get('/api/conversations', authenticateToken, (req: AuthRequest, res: Response) => {
     const userId = req.user!.id;
-    let userConvs = db.aiConversations
+    const userConvs = db.aiConversations
       .filter(c => c.userId === userId)
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-
-    // Auto-create a starter conversation if none exists
-    if (userConvs.length === 0) {
-      const now = new Date().toISOString();
-      const starter: DBAiConversation = {
-        id: `conv-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-        userId,
-        title: 'New Conversation',
-        createdAt: now,
-        updatedAt: now
-      };
-      db.aiConversations.push(starter);
-      saveDb();
-      userConvs = [starter];
-    }
 
     res.json(userConvs);
   });
@@ -2680,10 +3356,17 @@ async function startServer() {
   app.delete('/api/conversations/:id', authenticateToken, (req: AuthRequest, res: Response) => {
     const { id } = req.params;
     const userId = req.user!.id;
-    db.aiConversations = db.aiConversations.filter(c => !(c.id === id && c.userId === userId));
-    db.aiMessages = db.aiMessages.filter(m => !(m.conversationId === id && m.userId === userId));
-    saveDb();
-    res.json({ success: true });
+    const convIndex = db.aiConversations.findIndex(c => c.id === id && c.userId === userId);
+    if (convIndex !== -1) {
+      db.aiConversations.splice(convIndex, 1);
+    }
+    // Delete all messages belonging to this conversation
+    const prevMsgCount = db.aiMessages.length;
+    db.aiMessages = db.aiMessages.filter(m => m.conversationId !== id);
+    if (convIndex !== -1 || db.aiMessages.length !== prevMsgCount) {
+      saveDb();
+    }
+    res.json({ success: true, id });
   });
 
   // Clear all messages in a conversation
@@ -2692,12 +3375,15 @@ async function startServer() {
     const userId = req.user!.id;
     const conv = db.aiConversations.find(c => c.id === id && c.userId === userId);
     if (!conv) {
-      res.status(404).json({ error: 'Conversation not found' });
+      res.json({ success: true });
       return;
     }
-    db.aiMessages = db.aiMessages.filter(m => !(m.conversationId === id && m.userId === userId));
-    conv.updatedAt = new Date().toISOString();
-    saveDb();
+    const prevMsgCount = db.aiMessages.length;
+    db.aiMessages = db.aiMessages.filter(m => m.conversationId !== id);
+    if (db.aiMessages.length !== prevMsgCount) {
+      conv.updatedAt = new Date().toISOString();
+      saveDb();
+    }
     res.json({ success: true });
   });
 
@@ -2785,15 +3471,26 @@ async function startServer() {
     };
     db.aiMessages.push(userMessageObj);
 
-    // 3. Gather recent conversation turns
+    // 3. Context Payload Optimization & Reasoning Steps
+    const isCasual = isCasualUserMessage(cleanUserMessage, Boolean(context));
+    const plannedSteps = determineInitialReasoningSteps(cleanUserMessage, context, isCasual);
+    const historyLimit = isCasual ? 2 : 6;
+
     const recentMessages = db.aiMessages
-      .filter(m => m.conversationId === id && m.userId === userId)
-      .slice(-12);
+      .filter(m => m.conversationId === id && m.userId === userId && m.id !== userMessageObj.id)
+      .slice(-historyLimit);
 
     const activeLanguage = req.user!.preferredAILanguage || 'English';
     const motherTongue = req.user!.motherTongue || 'Telugu';
 
-    let systemInstruction = `${SYSTEM_PROMPT_SECURITY_INJECTION_DEFENSE}
+    let systemInstruction = '';
+    if (isCasual) {
+      systemInstruction = `You are Sākshi, a sharp, warm mentor for college learners.
+Preferred Language: ${activeLanguage}.
+User Background: ${motherTongue}.
+Reply naturally, warmly, and concisely in 1-2 friendly sentences. Do not use generic corporate pleasantries, repetitive greetings, or robotic scripts. Answer in under 2 seconds.`;
+    } else {
+      systemInstruction = `${SYSTEM_PROMPT_SECURITY_INJECTION_DEFENSE}
 
 You are Sākshi, a deeply capable, intelligent, thoughtful general-purpose Normal AI.
 You are interacting with ${req.user!.displayName || 'the user'}.
@@ -2825,14 +3522,14 @@ CORE DIRECTIVES & CHARACTER:
    - DO NOT trigger Google Search for: conversational chitchat, emotional support, coding/debugging advice, communication frameworks, explanations of established concepts, study techniques, or personal questions. Answer these immediately from your deep internal intellect for sub-second streaming speed.
    - When web search is triggered, synthesize findings articulately with clear attribution while keeping a warm, approachable tone.`;
 
-    if (context) {
-      const cleanFramework = sanitizeInput(context.frameworkName || 'Communication Framework', 100);
-      const cleanFormula = sanitizeInput(context.frameworkFormula || '', 100);
-      const cleanPrompt = sanitizeInput(context.exercisePrompt || '', 500);
-      const cleanAnswer = sanitizeInput(context.userSubmittedAnswer || '', 2000);
-      const cleanFeedback = sanitizeInput(context.evaluationFeedback || '', 2000);
+      if (context) {
+        const cleanFramework = sanitizeInput(context.frameworkName || 'Communication Framework', 100);
+        const cleanFormula = sanitizeInput(context.frameworkFormula || '', 100);
+        const cleanPrompt = sanitizeInput(context.exercisePrompt || '', 500);
+        const cleanAnswer = sanitizeInput(context.userSubmittedAnswer || '', 2000);
+        const cleanFeedback = sanitizeInput(context.evaluationFeedback || '', 2000);
 
-      systemInstruction += `\n\nCOMMUNICATION MASTERY ACTIVE CONTEXT:
+        systemInstruction += `\n\nCOMMUNICATION MASTERY ACTIVE CONTEXT:
 The user is currently inside Communication Mastery learning the framework: "${cleanFramework}" (${cleanFormula}).
 Level ${context.levelNumber || ''}: "${context.levelTitle || ''}" (World ${context.worldNumber || ''}: ${context.worldTitle || ''}).
 Exercise Prompt / Scenario: "${cleanPrompt}"
@@ -2841,6 +3538,7 @@ ${cleanFeedback ? `Current Evaluation: """${cleanFeedback}"""` : ''}
 
 The user is asking you for help, feedback, translation, or clarification regarding this framework or their answer.
 Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review their response against the framework constructively. If they ask for another example, provide a practical, real-life everyday scenario. If they ask in Telugu/Tenglish, reply warmly in Tenglish.`;
+      }
     }
 
     let assistantText = '';
@@ -2854,12 +3552,16 @@ Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review t
           role: m.role === 'model' ? 'model' : 'user',
           parts: [{ text: sanitizeInput(m.content, 3000) }]
         }));
+        contents.push({
+          role: 'user',
+          parts: [{ text: cleanUserMessage }]
+        });
 
-        const useSearch = shouldEnableGoogleSearch(cleanUserMessage);
+        const useSearch = !isCasual && shouldEnableGoogleSearch(cleanUserMessage);
         const config: any = {
           systemInstruction,
           temperature: 0.7,
-          maxOutputTokens: 1200
+          maxOutputTokens: isCasual ? 220 : 1200
         };
         if (useSearch) {
           config.tools = [{ googleSearch: {} }];
@@ -2965,6 +3667,7 @@ Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review t
       userId,
       role: 'model',
       content: assistantText,
+      reasoningSteps: plannedSteps.length > 0 ? plannedSteps.map(s => ({ ...s, status: 'completed' })) : undefined,
       groundingSources: groundingSources.length > 0 ? groundingSources : undefined,
       webSearchQueries: webSearchQueries.length > 0 ? webSearchQueries : undefined,
       createdAt: new Date().toISOString()
@@ -3019,6 +3722,17 @@ Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review t
       db.aiConversations.push(conv);
     }
 
+    // Set up request abort tracking so when the client aborts (e.g. Stop button),
+    // we stop Gemini generation immediately and do not persist any assistant response.
+    let isClientDisconnected = false;
+    const streamAbortController = new AbortController();
+
+    const onClientClose = () => {
+      isClientDisconnected = true;
+      streamAbortController.abort();
+    };
+    req.on('close', onClientClose);
+
     // 1. Detect natural language switching requests
     let switchedLanguage: string | undefined;
     const lowerInput = cleanUserMessage.toLowerCase();
@@ -3064,12 +3778,19 @@ Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review t
     db.aiMessages.push(userMessageObj);
     saveDb();
 
-    // 4. Set SSE Stream Headers
+    const isInstant = isInstantGreeting(cleanUserMessage, Boolean(context));
+    const isCasual = isInstant || isCasualUserMessage(cleanUserMessage, Boolean(context));
+
+    // 4. Set SSE Stream Headers with zero buffering
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+
+    // Immediately prime stream to bypass any proxy delays
+    res.write(': stream-init\n\n');
+    (res as any).flush?.();
 
     // Send initial start event
     res.write(`data: ${JSON.stringify({
@@ -3077,17 +3798,89 @@ Answer naturally as Sākshi. If they ask "Na answer correct ga undha?", review t
       userMessage: userMessageObj,
       removedMessageIds: removedIds
     })}\n\n`);
+    (res as any).flush?.();
 
-    // Prepare system instruction and context
     const user = db.users.find(u => u.id === userId);
     const activeLanguage = switchedLanguage || user?.preferredAILanguage || 'English';
 
-    const recentMessages = db.aiMessages
-      .filter(m => m.conversationId === id && m.userId === userId)
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-      .slice(-10);
+    // Fast-path for instant greetings
+    if (isInstant) {
+      const instantGreetingText = getInstantGreetingText(cleanUserMessage, activeLanguage);
 
-    let systemInstruction = `You are "Sākshi" (సాక్షి / साक्षी), an exceptionally intelligent, insightful, and natural AI companion and mentor for college students and ambitious learners.
+      const tokenChunks = instantGreetingText.split(/(\s+)/);
+      for (const token of tokenChunks) {
+        if (!token) continue;
+        if (isClientDisconnected || streamAbortController.signal.aborted || res.writableEnded || req.destroyed) break;
+        res.write(`data: ${JSON.stringify({ type: 'delta', text: token })}\n\n`);
+        (res as any).flush?.();
+        await new Promise(r => setTimeout(r, 12));
+      }
+
+      if (isClientDisconnected || streamAbortController.signal.aborted || res.writableEnded || req.destroyed) {
+        req.removeListener('close', onClientClose);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
+      const assistantMessageObj: DBAiMessage = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}-a`,
+        conversationId: id,
+        userId,
+        role: 'model',
+        content: instantGreetingText,
+        createdAt: new Date().toISOString(),
+        modelUsed: 'instant-greeting-fastpath',
+        reasoningSteps: []
+      };
+      db.aiMessages.push(assistantMessageObj);
+
+      const totalMessagesInConv = db.aiMessages.filter(m => m.conversationId === id).length;
+      let updatedConversation = db.aiConversations.find(c => c.id === id);
+      if (totalMessagesInConv <= 2 && updatedConversation) {
+        const titleCandidate = cleanUserMessage.length > 28
+          ? cleanUserMessage.substring(0, 28) + '...'
+          : cleanUserMessage;
+        updatedConversation.title = titleCandidate.charAt(0).toUpperCase() + titleCandidate.slice(1);
+        updatedConversation.updatedAt = new Date().toISOString();
+      }
+      saveDb();
+
+      req.removeListener('close', onClientClose);
+      if (!res.writableEnded && !req.destroyed) {
+        res.write(`data: ${JSON.stringify({
+          type: 'done',
+          assistantMessage: assistantMessageObj,
+          conversation: updatedConversation,
+          switchedLanguage
+        })}\n\n`);
+        (res as any).flush?.();
+        res.end();
+      }
+      return;
+    }
+
+    // Emit initial visible reasoning/research steps (bypassed for casual messages)
+    const plannedSteps = determineInitialReasoningSteps(cleanUserMessage, context, isCasual);
+    const currentSteps: ReasoningStep[] = [...plannedSteps];
+    for (const step of currentSteps) {
+      if (isClientDisconnected || streamAbortController.signal.aborted || res.writableEnded || req.destroyed) break;
+      res.write(`data: ${JSON.stringify({ type: 'step', step })}\n\n`);
+    }
+    (res as any).flush?.();
+
+    const historyLimit = isCasual ? 2 : 6;
+    const recentMessages = db.aiMessages
+      .filter(m => m.conversationId === id && m.userId === userId && m.id !== userMessageObj.id)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .slice(-historyLimit);
+
+    let systemInstruction = '';
+    if (isCasual) {
+      systemInstruction = `You are Sākshi (సాక్షి / साक्षी), a sharp, warm mentor and conversational AI companion for college learners.
+Preferred Language: "${activeLanguage}".
+Reply naturally, warmly, and concisely in 1-2 friendly sentences. Do not use generic corporate pleasantries, repetitive greetings, or robotic scripts.`;
+    } else {
+      systemInstruction = `You are "Sākshi" (సాక్షి / साक्षी), an exceptionally intelligent, insightful, and natural AI companion and mentor for college students and ambitious learners.
 Current user preferred language: "${activeLanguage}".
 
 CORE BEHAVIOR RULES:
@@ -3109,20 +3902,21 @@ CORE BEHAVIOR RULES:
 3. CONVERSATIONAL INTELLECT & NATURAL STYLE:
    - Speak naturally. No rigid corporate clichés, no robotic pleasantries. Talk like a sharp, supportive, articulate friend.`;
 
-    if (context) {
-      const cleanFramework = sanitizeInput(context.frameworkName || 'Communication Framework', 100);
-      const cleanFormula = sanitizeInput(context.frameworkFormula || '', 100);
-      const cleanPrompt = sanitizeInput(context.exercisePrompt || '', 500);
-      const cleanAnswer = sanitizeInput(context.userSubmittedAnswer || '', 2000);
-      const cleanFeedback = sanitizeInput(context.evaluationFeedback || '', 2000);
+      if (context) {
+        const cleanFramework = sanitizeInput(context.frameworkName || 'Communication Framework', 100);
+        const cleanFormula = sanitizeInput(context.frameworkFormula || '', 100);
+        const cleanPrompt = sanitizeInput(context.exercisePrompt || '', 500);
+        const cleanAnswer = sanitizeInput(context.userSubmittedAnswer || '', 2000);
+        const cleanFeedback = sanitizeInput(context.evaluationFeedback || '', 2000);
 
-      systemInstruction += `\n\nCOMMUNICATION MASTERY ACTIVE CONTEXT:
+        systemInstruction += `\n\nCOMMUNICATION MASTERY ACTIVE CONTEXT:
 The user is currently inside Communication Mastery learning the framework: "${cleanFramework}" (${cleanFormula}).
 Level ${context.levelNumber || ''}: "${context.levelTitle || ''}" (World ${context.worldNumber || ''}: ${context.worldTitle || ''}).
 Exercise Prompt / Scenario: "${cleanPrompt}"
 ${cleanAnswer ? `User's Practice Response: """${cleanAnswer}"""` : ''}
 ${cleanFeedback ? `Current Evaluation: """${cleanFeedback}"""` : ''}
 The user is asking you for help, feedback, translation, or clarification regarding this framework. Answer naturally as Sākshi.`;
+      }
     }
 
     let assistantText = '';
@@ -3132,23 +3926,28 @@ The user is asking you for help, feedback, translation, or clarification regardi
     const ai = getGeminiClient();
     let streamSucceeded = false;
 
-    if (ai) {
+    if (ai && !isClientDisconnected && !streamAbortController.signal.aborted) {
       try {
         const contents: any[] = recentMessages.map(m => ({
           role: m.role === 'model' ? 'model' : 'user',
           parts: [{ text: sanitizeInput(m.content, 3000) }]
         }));
+        contents.push({
+          role: 'user',
+          parts: [{ text: cleanUserMessage }]
+        });
 
-        const useSearch = shouldEnableGoogleSearch(cleanUserMessage);
+        const useSearch = !isCasual && shouldEnableGoogleSearch(cleanUserMessage);
         const config: any = {
           systemInstruction,
           temperature: 0.7,
-          maxOutputTokens: 1200
+          maxOutputTokens: isCasual ? 220 : 1200
         };
         if (useSearch) {
           config.tools = [{ googleSearch: {} }];
         }
 
+        let firstChunkReceived = false;
         const streamResult = await streamGeminiContentSafe(
           ai,
           {
@@ -3156,10 +3955,40 @@ The user is asking you for help, feedback, translation, or clarification regardi
             config
           },
           (chunk, chunkText) => {
+            if (isClientDisconnected || streamAbortController.signal.aborted || res.writableEnded || req.destroyed) return;
+            if (!firstChunkReceived) {
+              firstChunkReceived = true;
+              for (const s of currentSteps) {
+                if (s.status !== 'completed') {
+                  s.status = 'completed';
+                  if (!res.writableEnded && !req.destroyed) {
+                    res.write(`data: ${JSON.stringify({ type: 'step', step: s })}\n\n`);
+                  }
+                }
+              }
+              (res as any).flush?.();
+            }
+
             if (!res.writableEnded && !req.destroyed) {
               res.write(`data: ${JSON.stringify({ type: 'delta', text: chunkText })}\n\n`);
+              (res as any).flush?.();
             }
-          }
+          },
+          async (searchQuery) => {
+            if (isClientDisconnected || streamAbortController.signal.aborted || res.writableEnded || req.destroyed) return;
+            const searchStep: ReasoningStep = {
+              id: `step-web-${Date.now()}`,
+              label: `Searching web: "${searchQuery}"`,
+              status: 'completed',
+              timestamp: Date.now()
+            };
+            currentSteps.push(searchStep);
+            if (!res.writableEnded && !req.destroyed) {
+              res.write(`data: ${JSON.stringify({ type: 'step', step: searchStep })}\n\n`);
+              (res as any).flush?.();
+            }
+          },
+          streamAbortController.signal
         );
 
         assistantText = streamResult.text;
@@ -3167,12 +3996,33 @@ The user is asking you for help, feedback, translation, or clarification regardi
         webSearchQueries.push(...streamResult.webSearchQueries);
         streamSucceeded = assistantText.trim().length > 0;
       } catch (err: any) {
-        console.warn('Normal AI stream Gemini error, falling back:', err?.message?.slice(0, 120) || 'error');
+        if (!isClientDisconnected && !streamAbortController.signal.aborted) {
+          console.log('[Normal AI stream] Gemini stream fallback triggered:', err?.message?.slice(0, 80) || 'transient error');
+        }
       }
+    }
+
+    // If client disconnected or pressed Stop, exit immediately without fallback or persistence
+    if (isClientDisconnected || streamAbortController.signal.aborted || req.destroyed || res.writableEnded) {
+      req.removeListener('close', onClientClose);
+      if (!res.writableEnded) {
+        res.end();
+      }
+      return;
     }
 
     // 5. Intelligent Fallback if Gemini stream unavailable
     if (!streamSucceeded || !assistantText) {
+      for (const s of currentSteps) {
+        if (s.status !== 'completed') {
+          s.status = 'completed';
+          if (!res.writableEnded && !req.destroyed) {
+            res.write(`data: ${JSON.stringify({ type: 'step', step: s })}\n\n`);
+          }
+        }
+      }
+      (res as any).flush?.();
+
       const cleanInput = cleanUserMessage;
       const isTenglish = activeLanguage.includes('Telugu') || /(undhi|cheyyi|ela|avuthundhi|cheppali|kavali|matladu|enti|chudu|leka|chesuko)/i.test(cleanInput);
 
@@ -3217,15 +4067,25 @@ The user is asking you for help, feedback, translation, or clarification regardi
       }
 
       // Stream fallback text smoothly
-      if (!res.writableEnded && !req.destroyed) {
+      if (!res.writableEnded && !req.destroyed && !isClientDisconnected && !streamAbortController.signal.aborted) {
         const words = assistantText.split(' ');
         for (let i = 0; i < words.length; i += 3) {
-          if (res.writableEnded || req.destroyed) break;
+          if (res.writableEnded || req.destroyed || isClientDisconnected || streamAbortController.signal.aborted) break;
           const chunkStr = words.slice(i, i + 3).join(' ') + (i + 3 < words.length ? ' ' : '');
           res.write(`data: ${JSON.stringify({ type: 'delta', text: chunkStr })}\n\n`);
+          (res as any).flush?.();
           await new Promise(r => setTimeout(r, 20));
         }
       }
+    }
+
+    // Final check: if user aborted or disconnected, do NOT persist assistant message
+    if (isClientDisconnected || streamAbortController.signal.aborted || req.destroyed || res.writableEnded) {
+      req.removeListener('close', onClientClose);
+      if (!res.writableEnded) {
+        res.end();
+      }
+      return;
     }
 
     // 6. Persist Assistant Message
@@ -3235,6 +4095,7 @@ The user is asking you for help, feedback, translation, or clarification regardi
       userId,
       role: 'model',
       content: assistantText,
+      reasoningSteps: currentSteps.length > 0 ? currentSteps.map(s => ({ ...s, status: 'completed' })) : undefined,
       groundingSources: groundingSources.length > 0 ? groundingSources : undefined,
       webSearchQueries: webSearchQueries.length > 0 ? webSearchQueries : undefined,
       createdAt: new Date().toISOString()
@@ -3250,6 +4111,7 @@ The user is asking you for help, feedback, translation, or clarification regardi
     conv.updatedAt = new Date().toISOString();
     saveDb();
 
+    req.removeListener('close', onClientClose);
     if (!res.writableEnded && !req.destroyed) {
       res.write(`data: ${JSON.stringify({
         type: 'done',
@@ -3283,6 +4145,24 @@ The user is asking you for help, feedback, translation, or clarification regardi
     const user = req.user!;
     const state = getUserJourneyState(user.id);
     res.json(state);
+  });
+
+  // Two-way merge progress endpoint: union merge client local/guest progress with database & Supabase
+  app.post('/api/journey/state/merge', authenticateToken, async (req: AuthRequest, res) => {
+    try {
+      const user = req.user!;
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+      const mergedState = await performTwoWayProgressMerge(
+        user.id,
+        user.email,
+        token,
+        req.body?.localProgress
+      );
+      res.json({ success: true, journeyState: mergedState });
+    } catch (err: any) {
+      console.error('[Merge] Error performing progress merge:', err);
+      res.status(500).json({ error: 'Failed to merge progress records' });
+    }
   });
 
   // Get details for a specific Journey Level
@@ -3795,7 +4675,14 @@ The user is asking you for help, feedback, translation, or clarification regardi
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     try {
       await Promise.race([
-        syncUserProgressToSupabase(user.id, token, updatedState.currentLevel, completedLevels),
+        syncUserProgressToSupabase(
+          user.id,
+          token,
+          updatedState.currentLevel,
+          completedLevels,
+          user.email,
+          user.displayName
+        ),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Supabase sync timeout')), 3500))
       ]);
     } catch (err) {
@@ -4321,7 +5208,25 @@ Respond with pure JSON strictly matching this schema:
   // ---------------- VITE / STATIC SERVING ----------------
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        watch: {
+          ignored: [
+            '**/data/**',
+            'data/**',
+            '**/data/store.json',
+            '**/store.json',
+            '**/*.tmp',
+            '**/store.json.tmp',
+            (filePath: string) =>
+              typeof filePath === 'string' &&
+              (filePath.includes('/data/') ||
+                filePath.includes('data/store.json') ||
+                filePath.includes('store.json') ||
+                filePath.endsWith('.tmp'))
+          ]
+        }
+      },
       appType: 'spa'
     });
     app.use(vite.middlewares);

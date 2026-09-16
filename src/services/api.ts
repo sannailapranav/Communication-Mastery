@@ -13,12 +13,107 @@ import {
   JourneyEvaluationResult,
   NormalAiConversation,
   NormalAiMessage,
+  ReasoningStep,
   QuestionTranslationResponse,
   DynamicAIExercise
 } from '../types';
 
 const TOKEN_KEY = 'comm_mastery_token';
 const CACHED_USER_KEY = 'comm_mastery_user';
+const GUEST_PROGRESS_KEY = 'cm_guest_journey_progress';
+const LOCAL_SNAPSHOT_KEY = 'cm_local_journey_snapshot';
+
+export interface LocalGuestProgress {
+  completedLevels: number[];
+  levels: Record<number, {
+    levelNumber: number;
+    status: 'LOCKED' | 'AVAILABLE' | 'IN_PROGRESS' | 'COMPLETED';
+    score?: number;
+    currentStep?: number;
+    completedAt?: string;
+    answers?: Record<number, string>;
+  }>;
+  currentLevel?: number;
+}
+
+export function getLocalGuestProgress(): LocalGuestProgress | null {
+  try {
+    const raw = localStorage.getItem(GUEST_PROGRESS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setLocalGuestProgress(data: LocalGuestProgress | null): void {
+  try {
+    if (data) {
+      localStorage.setItem(GUEST_PROGRESS_KEY, JSON.stringify(data));
+    } else {
+      localStorage.removeItem(GUEST_PROGRESS_KEY);
+    }
+  } catch {}
+}
+
+export function clearLocalGuestProgress(): void {
+  try {
+    localStorage.removeItem(GUEST_PROGRESS_KEY);
+  } catch {}
+}
+
+export function recordLocalGuestCompletion(levelNumber: number, data?: any): void {
+  try {
+    const current = getLocalGuestProgress() || { completedLevels: [], levels: {}, currentLevel: 1 };
+    if (!current.completedLevels.includes(levelNumber)) {
+      current.completedLevels.push(levelNumber);
+      current.completedLevels.sort((a, b) => a - b);
+    }
+    const score = typeof data === 'number' ? data : (data?.score || 85);
+    const now = new Date().toISOString();
+    current.levels[levelNumber] = {
+      levelNumber,
+      status: 'COMPLETED',
+      score,
+      currentStep: 7,
+      completedAt: now,
+      answers: typeof data === 'object' ? data?.answers : undefined
+    };
+    // Unlock next level
+    if (levelNumber < 75) {
+      const nextLevel = levelNumber + 1;
+      if (!current.levels[nextLevel] || current.levels[nextLevel].status === 'LOCKED') {
+        current.levels[nextLevel] = {
+          levelNumber: nextLevel,
+          status: 'AVAILABLE',
+          currentStep: 1
+        };
+      }
+      current.currentLevel = nextLevel;
+    }
+    setLocalGuestProgress(current);
+  } catch (err) {
+    console.warn('[Local Progress] Error recording guest completion:', err);
+  }
+}
+
+export function getLocalProgressSnapshot(): JourneyStateSummary | null {
+  try {
+    const raw = localStorage.getItem(LOCAL_SNAPSHOT_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLocalProgressSnapshot(state: JourneyStateSummary | null): void {
+  try {
+    if (state) {
+      localStorage.setItem(LOCAL_SNAPSHOT_KEY, JSON.stringify(state));
+    } else {
+      localStorage.removeItem(LOCAL_SNAPSHOT_KEY);
+    }
+  } catch {}
+}
 
 export function getStoredToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -108,6 +203,11 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   return data as T;
 }
 
+let inFlightSyncRequest: {
+  token: string;
+  promise: Promise<{ user: UserProfile; isNewUser: boolean }>;
+} | null = null;
+
 export const api = {
   async register(email: string, password: string, displayName: string): Promise<{ token: string; user: UserProfile }> {
     const res = await request<{ token: string; user: UserProfile }>('/api/auth/register', {
@@ -129,15 +229,57 @@ export const api = {
     return res;
   },
 
-  async syncSupabaseUser(supabaseAccessToken: string): Promise<{ user: UserProfile; isNewUser: boolean }> {
-    const res = await request<{ user: UserProfile; isNewUser: boolean }>('/api/auth/sync-supabase-user', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${supabaseAccessToken}`
+  async syncSupabaseUser(
+    supabaseAccessToken: string,
+    localProgress?: any
+  ): Promise<{ user: UserProfile; isNewUser: boolean; journeyState?: JourneyStateSummary }> {
+    if (inFlightSyncRequest && inFlightSyncRequest.token === supabaseAccessToken && !localProgress) {
+      return inFlightSyncRequest.promise;
+    }
+
+    const payloadProgress = localProgress || getLocalGuestProgress();
+
+    const syncPromise = (async () => {
+      try {
+        const res = await request<{ user: UserProfile; isNewUser: boolean; journeyState?: JourneyStateSummary }>('/api/auth/sync-supabase-user', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${supabaseAccessToken}`
+          },
+          body: JSON.stringify({ localProgress: payloadProgress })
+        });
+        setStoredToken(supabaseAccessToken);
+        setStoredUser(res.user);
+        if (res.journeyState) {
+          saveLocalProgressSnapshot(res.journeyState);
+          clearLocalGuestProgress();
+        }
+        return res;
+      } finally {
+        if (inFlightSyncRequest && inFlightSyncRequest.token === supabaseAccessToken) {
+          inFlightSyncRequest = null;
+        }
       }
+    })();
+
+    inFlightSyncRequest = {
+      token: supabaseAccessToken,
+      promise: syncPromise
+    };
+
+    return syncPromise;
+  },
+
+  async mergeJourneyProgress(localProgress?: any): Promise<{ success: boolean; journeyState: JourneyStateSummary }> {
+    const payload = localProgress || getLocalGuestProgress();
+    const res = await request<{ success: boolean; journeyState: JourneyStateSummary }>('/api/journey/state/merge', {
+      method: 'POST',
+      body: JSON.stringify({ localProgress: payload })
     });
-    setStoredToken(supabaseAccessToken);
-    setStoredUser(res.user);
+    if (res.journeyState) {
+      saveLocalProgressSnapshot(res.journeyState);
+      clearLocalGuestProgress();
+    }
     return res;
   },
 
@@ -454,6 +596,7 @@ export const api = {
     },
     callbacks: {
       onStart?: (data: { userMessage: NormalAiMessage; removedMessageIds?: string[] }) => void;
+      onStep?: (step: ReasoningStep) => void;
       onDelta?: (text: string) => void;
       onDone?: (data: { assistantMessage: NormalAiMessage; conversation: NormalAiConversation; switchedLanguage?: string }) => void;
       onError?: (err: any) => void;
@@ -502,6 +645,8 @@ export const api = {
               const parsed = JSON.parse(dataStr);
               if (parsed.type === 'start' && callbacks.onStart) {
                 callbacks.onStart(parsed);
+              } else if (parsed.type === 'step' && callbacks.onStep) {
+                callbacks.onStep(parsed.step);
               } else if (parsed.type === 'delta' && callbacks.onDelta) {
                 callbacks.onDelta(parsed.text);
               } else if (parsed.type === 'done' && callbacks.onDone) {
@@ -517,8 +662,10 @@ export const api = {
         }
       }
     } catch (err: any) {
-      if (err?.name === 'AbortError') {
-        throw err;
+      if (err?.name === 'AbortError' || signal?.aborted) {
+        const abortErr = new Error('Aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
       }
       if (callbacks.onError) {
         callbacks.onError(err);

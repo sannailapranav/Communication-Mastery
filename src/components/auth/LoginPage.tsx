@@ -17,7 +17,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   onBackToLanding,
   initialEmail = ''
 }) => {
-  const { login, error: authError, clearError } = useAuth();
+  const { login, error: authError, clearError, continueAsGuest } = useAuth();
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -275,7 +275,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
             </form>
           )}
 
-          <div className="mt-6 border-t border-stone-100 pt-5 text-center">
+          <div className="mt-6 border-t border-stone-100 pt-5 text-center space-y-3">
             <p className="text-xs text-stone-600">
               Don't have an account yet?{' '}
               <button
@@ -286,6 +286,18 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                 Create your account
               </button>
             </p>
+            <div>
+              <button
+                type="button"
+                onClick={() => {
+                  continueAsGuest();
+                  onSuccess();
+                }}
+                className="text-xs font-semibold text-stone-500 hover:text-stone-800 transition-colors cursor-pointer"
+              >
+                Explore curriculum as guest (progress auto-merges on login)
+              </button>
+            </div>
           </div>
         </div>
       </div>

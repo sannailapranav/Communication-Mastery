@@ -37,6 +37,7 @@ interface AuthContextType {
   ) => Promise<void>;
   clearError: () => void;
   syncSessionToken: (token: string) => Promise<UserProfile>;
+  continueAsGuest: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -195,6 +196,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             console.error('Failed to get user after OAuth popup:', e);
           }
         }
+        if (event.data?.journeyState) {
+          window.dispatchEvent(new CustomEvent('journey:state-synced', { detail: event.data.journeyState }));
+        }
       }
     };
     window.addEventListener('message', handleWindowMessage);
@@ -229,6 +233,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setStoredToken(session.access_token);
         const syncResult = await api.syncSupabaseUser(session.access_token);
         setUser(syncResult.user);
+        if (syncResult.journeyState) {
+          window.dispatchEvent(new CustomEvent('journey:state-synced', { detail: syncResult.journeyState }));
+        }
         return;
       } catch (err: any) {
         const actualError = err?.message || 'Invalid email or password.';
@@ -642,7 +649,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStoredToken(token);
     const syncRes = await api.syncSupabaseUser(token);
     setUser(syncRes.user);
+    if (syncRes.journeyState) {
+      window.dispatchEvent(new CustomEvent('journey:state-synced', { detail: syncRes.journeyState }));
+    }
     return syncRes.user;
+  };
+
+  const continueAsGuest = () => {
+    const guestUser: UserProfile = {
+      id: 'guest-user',
+      email: 'guest@learner.internal',
+      displayName: 'Guest Learner',
+      learningLevel: 'Beginner',
+      goals: ['Speak English confidently', 'Improve conversations'],
+      motherTongue: 'Telugu',
+      learningLanguage: 'English',
+      preferredAILanguage: 'Telugu (Tenglish)',
+      scriptPreference: 'romanized',
+      conversationalStyle: 'natural',
+      isOnboarded: true,
+      isGuest: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    setUser(guestUser);
+    setStoredUser(guestUser);
   };
 
   const updateProfile = async (updates: Partial<UserProfile>) => {
@@ -695,7 +726,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         updateProfile,
         completeOnboarding,
         clearError,
-        syncSessionToken
+        syncSessionToken,
+        continueAsGuest
       }}
     >
       {children}

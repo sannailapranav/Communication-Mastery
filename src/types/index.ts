@@ -53,6 +53,7 @@ export interface UserProfile {
   locale?: string;
   currentModule?: string;
   isOnboarded: boolean;
+  isGuest?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -467,12 +468,21 @@ export interface GroundingSource {
   uri: string;
 }
 
+export interface ReasoningStep {
+  id: string;
+  label: string;
+  detail?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  timestamp?: number;
+}
+
 export interface NormalAiMessage {
   id: string;
   conversationId: string;
   userId?: string;
   role: 'user' | 'model';
   content: string;
+  reasoningSteps?: ReasoningStep[];
   groundingSources?: GroundingSource[];
   webSearchQueries?: string[];
   createdAt: string;

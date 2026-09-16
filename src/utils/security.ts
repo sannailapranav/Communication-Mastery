@@ -231,3 +231,13 @@ export const rateLimitAuth = createRateLimiter({
   name: 'auth',
   errorMessage: 'Too many authentication attempts. Please wait a minute and try again.'
 });
+
+// 6. Session Sync: generous limits without debounce to handle popup callbacks and auth listeners concurrently
+export const rateLimitSessionSync = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 60,
+  debounceMs: 0,
+  name: 'session-sync',
+  errorMessage: 'Too many session synchronization attempts. Please wait a moment.'
+});
+

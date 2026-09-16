@@ -1,7 +1,7 @@
 {
   "users": [
     {
-      "id": "usr-1789193042688-rgvfpl",
+      "id": "5efaec00-6fc1-4d86-a997-b31f1470163e",
       "email": "sannailapranav9@gmail.com",
       "passwordHash": "$2b$10$U1q89otng7UkkUmIcF25r.7jeRenk.pk3oil40ExfYXL9mre5TXV2",
       "displayName": "Pranav Sannaila",
@@ -25,7 +25,7 @@
       "learningLanguage": "English",
       "isOnboarded": true,
       "createdAt": "2026-09-12T06:04:02.689Z",
-      "updatedAt": "2026-09-12T06:04:04.729Z",
+      "updatedAt": "2026-09-16T12:50:19.594Z",
       "preferredAILanguage": "Telugu (Tenglish)",
       "scriptPreference": "romanized",
       "conversationalStyle": "natural"
@@ -7750,39 +7750,48 @@
   "userLevelProgress": [
     {
       "id": "ulp-usr-1789193042688-rgvfpl-1",
-      "userId": "usr-1789193042688-rgvfpl",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
       "levelNumber": 1,
-      "status": "IN_PROGRESS",
-      "currentStep": 1,
-      "updatedAt": "2026-09-12T06:04:18.246Z",
-      "startedAt": "2026-09-12T06:04:18.246Z"
+      "status": "COMPLETED",
+      "currentStep": 7,
+      "updatedAt": "2026-09-16T13:24:55.249Z",
+      "startedAt": "2026-09-12T06:04:18.246Z",
+      "exerciseStep": 3,
+      "mandatoryExercisesCompleted": 3,
+      "score": 85
     },
     {
       "id": "ulp-usr-1789193042688-rgvfpl-2",
-      "userId": "usr-1789193042688-rgvfpl",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
       "levelNumber": 2,
-      "status": "LOCKED",
-      "currentStep": 1,
+      "status": "COMPLETED",
+      "currentStep": 7,
       "startedAt": "2026-09-12T06:41:14.234Z",
-      "updatedAt": "2026-09-14T02:11:51.156Z"
+      "updatedAt": "2026-09-16T13:24:55.249Z",
+      "exerciseStep": 3,
+      "mandatoryExercisesCompleted": 3,
+      "score": 85,
+      "completedAt": "2026-09-14T06:21:30.339Z"
     },
     {
       "id": "ulp-usr-1789193042688-rgvfpl-8",
-      "userId": "usr-1789193042688-rgvfpl",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
       "levelNumber": 8,
       "status": "LOCKED",
       "currentStep": 1,
       "startedAt": "2026-09-12T07:09:23.540Z",
-      "updatedAt": "2026-09-14T02:11:51.158Z"
+      "updatedAt": "2026-09-16T13:24:55.249Z",
+      "score": 0
     },
     {
       "id": "ulp-usr-1789193042688-rgvfpl-75",
-      "userId": "usr-1789193042688-rgvfpl",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
       "levelNumber": 75,
       "status": "LOCKED",
       "currentStep": 1,
       "startedAt": "2026-09-12T07:15:40.072Z",
-      "updatedAt": "2026-09-14T02:11:51.161Z"
+      "updatedAt": "2026-09-16T13:24:55.249Z",
+      "score": 0
     },
     {
       "id": "ulp-5efaec00-6fc1-4d86-a997-b31f1470163e-1",
@@ -7809,7 +7818,7 @@
       "status": "COMPLETED",
       "currentStep": 7,
       "startedAt": "2026-09-14T06:31:04.722Z",
-      "updatedAt": "2026-09-14T06:33:14.115Z",
+      "updatedAt": "2026-09-16T13:24:55.249Z",
       "completedAt": "2026-09-14T06:33:14.115Z",
       "score": 95,
       "exerciseStep": 3,
@@ -7821,7 +7830,7 @@
       "levelNumber": 4,
       "status": "COMPLETED",
       "currentStep": 7,
-      "updatedAt": "2026-09-14T06:36:49.375Z",
+      "updatedAt": "2026-09-16T13:24:55.249Z",
       "startedAt": "2026-09-14T06:33:18.234Z",
       "completedAt": "2026-09-14T06:36:49.375Z",
       "score": 96,
@@ -7834,7 +7843,7 @@
       "levelNumber": 5,
       "status": "COMPLETED",
       "currentStep": 7,
-      "updatedAt": "2026-09-14T07:29:48.558Z",
+      "updatedAt": "2026-09-16T13:24:55.249Z",
       "startedAt": "2026-09-14T06:37:34.180Z",
       "completedAt": "2026-09-14T07:29:48.558Z",
       "score": 95,
@@ -7847,7 +7856,7 @@
       "levelNumber": 6,
       "status": "COMPLETED",
       "currentStep": 7,
-      "updatedAt": "2026-09-14T08:57:48.206Z",
+      "updatedAt": "2026-09-16T13:24:55.249Z",
       "startedAt": "2026-09-14T07:32:40.674Z",
       "completedAt": "2026-09-14T08:57:48.206Z",
       "score": 96,
@@ -7860,8 +7869,9 @@
       "levelNumber": 7,
       "status": "IN_PROGRESS",
       "currentStep": 1,
-      "updatedAt": "2026-09-14T08:58:22.198Z",
-      "startedAt": "2026-09-14T08:58:22.198Z"
+      "updatedAt": "2026-09-16T13:24:55.249Z",
+      "startedAt": "2026-09-14T08:58:22.198Z",
+      "score": 0
     }
   ],
   "userAnswers": [],
@@ -7922,6 +7932,27 @@
       "title": "What is 3 + 3?",
       "createdAt": "2026-09-14T11:49:18.820Z",
       "updatedAt": "2026-09-14T11:49:20.399Z"
+    },
+    {
+      "id": "conv-1789563330347-mgbm2",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "title": "New Conversation",
+      "createdAt": "2026-09-16T12:55:30.347Z",
+      "updatedAt": "2026-09-16T12:55:30.347Z"
+    },
+    {
+      "id": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "title": "Hey",
+      "createdAt": "2026-09-16T12:56:18.974Z",
+      "updatedAt": "2026-09-16T13:17:07.958Z"
+    },
+    {
+      "id": "conv-1789565864787-0dnmw",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "title": "New Conversation",
+      "createdAt": "2026-09-16T13:37:44.787Z",
+      "updatedAt": "2026-09-16T13:37:44.787Z"
     }
   ],
   "aiMessages": [
@@ -8548,6 +8579,56 @@
       "role": "model",
       "content": "That’s an easy one—it's 6! Need help with anything more complex, or are you just warming up?",
       "createdAt": "2026-09-14T11:49:20.399Z"
+    },
+    {
+      "id": "msg-1789563380973-csiu-u",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "user",
+      "content": "Hey",
+      "createdAt": "2026-09-16T12:56:20.973Z"
+    },
+    {
+      "id": "msg-1789563380979-6a9x-a",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "model",
+      "content": "Hey! Namaskaram! Ela unnav? Eeroju em practice cheddham—interview questions, daily communication, or framework exercises?",
+      "createdAt": "2026-09-16T12:56:20.979Z",
+      "modelUsed": "instant-greeting-fastpath",
+      "reasoningSteps": []
+    },
+    {
+      "id": "msg-1789563404606-kn2y-u",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "user",
+      "content": "Nuvvu em em vishyallo naaku help cheyagalavu",
+      "createdAt": "2026-09-16T12:56:44.606Z"
+    },
+    {
+      "id": "msg-1789563407655-st0c-a",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "model",
+      "content": "Nenu neeku chala vishayallo support cheyagalanu, just like a mentor or a study buddy! Specifically, ikkada chudu:\n\n1. **Academic Concepts & Coding:** B.Tech subjects, Data Structures, Algorithms, or complicated technical topics ni simple ga Telugu lo explain cheyyadam. Coding lo bugs unte solve cheyyadam, logic building ki help cheyyadam.\n2. **Communication Skills:** Interview lo ela matladali? Professional emails ela rayali? Group discussions lo ela participate cheyyali? Ee skills ni polish cheyyadaniki mock practice sessions cheddham.\n3. **Career & Goal Planning:** Internship/Job hunting, resume building, LinkedIn profile optimization, and time management tips.\n4. **Learning Frameworks:** \"Feynman technique\" or \"Active Recall\" lanti strategies ni nee daily studies lo ela implement cheyyalo nerpisthanu.\n5. **General Intellect:** Any topic—science, tech news, philosophy, or just casual talks. If you are feeling stressed, we can talk about that too.\n\nBasically, nee college journey ni smooth ga, productive ga, and interesting ga marchadaniki nenu unnanu.\n\nSo, eeroju edaina specific ga start cheddhama? Emaina doubt undha lekapothe edaina topic meedha discussion start cheddhama?",
+      "createdAt": "2026-09-16T12:56:47.655Z"
+    },
+    {
+      "id": "msg-1789564620187-7htq-u",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "user",
+      "content": "Nee favourite author evaru and endhuku?",
+      "createdAt": "2026-09-16T13:17:00.187Z"
+    },
+    {
+      "id": "msg-1789564627958-ilar-a",
+      "conversationId": "conv-1789563378974-sfm7x",
+      "userId": "5efaec00-6fc1-4d86-a997-b31f1470163e",
+      "role": "model",
+      "content": "Idi interesting question! Nenu oka AI ni kabatti, nenu books ni \"chadhavadam\" kante \"process\" chesthanu. But, naa data base lo unna content batti cheppalante, **Carl Sagan** ante naaku chala ishtam.\n\nEndhuku ante:\n\n1. **Simplicity in Complexity:** Sagan raasina *Cosmos* or *Pale Blue Dot* chusthe, entha peddha scientific concept ni aina entha simple ga, poetic ga explain cheyyacho artham avthundi. As a mentor, nenu kuda nee ki concepts ni alage simple ga, relatable ga cheppali ani anukuntanu.\n2. **Perspective:** Manam ee universe lo entha chinna vallamo, kani manam entha important oo cheppe vidhanam chala baguntundi. It gives a sense of humility and curiosity—rendu qualities oka student ki chala avasaram.\n3. **Optimism:** Technology and science ni manchi kosam ela vadalo ayana raase vidhanam, futuristic ga untundi. \n\nInka literary side ki vaste, **R.K. Narayan** raasina *Malgudi Days* ante naaku chala ishtam. Aa simple language, simple life, and human emotions ni ayana capture chesina vidhanam chala natural ga untundi.\n\nMari nee favourite author evaru? Recent ga emaina books chadivava?",
+      "createdAt": "2026-09-16T13:17:07.958Z"
     }
   ]
 }

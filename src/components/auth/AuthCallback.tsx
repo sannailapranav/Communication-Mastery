@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { initializeSupabase, getSupabase, getFriendlyOAuthErrorMessage } from '../../services/supabase';
-import { api, setStoredToken, setStoredUser } from '../../services/api';
+import { api, setStoredToken, setStoredUser, getLocalProgressSnapshot } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import { AlertCircle, ArrowLeft, CheckCircle2 } from 'lucide-react';
 
@@ -193,6 +193,8 @@ export const AuthCallback: React.FC<AuthCallbackProps> = ({
         clearError();
         console.log('[AuthCallback] Profile synchronized successfully:', userProfile.email);
 
+        const journeySnapshot = getLocalProgressSnapshot();
+
         // 8. Multi-channel broadcast to main application
         // Channel A: postMessage to window.opener
         if (window.opener && window.opener !== window) {
@@ -201,6 +203,7 @@ export const AuthCallback: React.FC<AuthCallbackProps> = ({
               {
                 type: 'OAUTH_AUTH_SUCCESS',
                 user: userProfile,
+                journeyState: journeySnapshot,
                 token: session.access_token
               },
               '*'
@@ -216,6 +219,7 @@ export const AuthCallback: React.FC<AuthCallbackProps> = ({
           bc.postMessage({
             type: 'OAUTH_AUTH_SUCCESS',
             user: userProfile,
+            journeyState: journeySnapshot,
             token: session.access_token
           });
           bc.close();
@@ -226,6 +230,7 @@ export const AuthCallback: React.FC<AuthCallbackProps> = ({
           localStorage.setItem('supabase_oauth_completed', JSON.stringify({
             type: 'OAUTH_AUTH_SUCCESS',
             user: userProfile,
+            journeyState: journeySnapshot,
             token: session.access_token,
             timestamp: Date.now()
           }));

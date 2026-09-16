@@ -10,7 +10,12 @@ import {
   MessageSquare,
   Square,
   Globe,
-  ExternalLink
+  ExternalLink,
+  Sparkles,
+  ChevronDown,
+  Loader2,
+  CheckCircle2,
+  CircleDashed
 } from 'lucide-react';
 import { api } from '../../services/api';
 import { voiceService } from '../../services/voiceService';
@@ -50,6 +55,14 @@ export const NormalAIContextDrawer: React.FC<NormalAIContextDrawerProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [expandedReasoningMsgIds, setExpandedReasoningMsgIds] = useState<Record<string, boolean>>({});
+
+  const toggleReasoning = (msgId: string) => {
+    setExpandedReasoningMsgIds(prev => ({
+      ...prev,
+      [msgId]: prev[msgId] === undefined ? false : !prev[msgId]
+    }));
+  };
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -125,19 +138,32 @@ export const NormalAIContextDrawer: React.FC<NormalAIContextDrawerProps> = ({
     setInputMessage('');
     setIsLoading(true);
 
+    const tempUserMsgId = `temp-u-${Date.now()}`;
     const tempUserMsg: NormalAiMessage = {
-      id: `temp-${Date.now()}`,
+      id: tempUserMsgId,
       conversationId: conversationId || '',
       role: 'user',
       content: text,
       createdAt: new Date().toISOString()
     };
-    setMessages((prev) => [...prev, tempUserMsg]);
+
+    const tempAssistantMsgId = `temp-a-${Date.now()}`;
+    const tempAssistantMsg: NormalAiMessage = {
+      id: tempAssistantMsgId,
+      conversationId: conversationId || '',
+      role: 'model',
+      content: '',
+      createdAt: new Date().toISOString()
+    };
+
+    setMessages((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
 
     let targetConvId = conversationId;
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
+
+    let accumulatedAssistantText = '';
 
     try {
       if (!targetConvId) {
@@ -146,16 +172,72 @@ export const NormalAIContextDrawer: React.FC<NormalAIContextDrawerProps> = ({
         setConversationId(newConv.id);
       }
 
-      const response = await api.sendNormalAIMessage(targetConvId, text, context, controller.signal);
-      const detail = await api.getConversation(targetConvId);
-      setMessages(detail.messages || [response.userMessage, response.assistantMessage]);
+      await api.streamNormalAIMessage(
+        targetConvId,
+        {
+          message: text,
+          context
+        },
+        {
+          onStart: (data) => {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === tempUserMsgId ? data.userMessage : m))
+            );
+          },
+          onStep: (step) => {
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id !== tempAssistantMsgId) return m;
+                const existing = m.reasoningSteps || [];
+                const idx = existing.findIndex((s) => s.id === step.id);
+                const updated = idx >= 0
+                  ? existing.map((s, i) => (i === idx ? step : s))
+                  : [...existing, step];
+                return { ...m, reasoningSteps: updated };
+              })
+            );
+          },
+          onDelta: (chunkText) => {
+            accumulatedAssistantText += chunkText;
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempAssistantMsgId
+                  ? { ...m, content: accumulatedAssistantText }
+                  : m
+              )
+            );
+          },
+          onDone: (data) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempAssistantMsgId ? data.assistantMessage : m
+              )
+            );
+          },
+          onError: (errMsg) => {
+            console.warn('Context drawer streaming error:', errMsg);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempAssistantMsgId && !m.content
+                  ? {
+                      ...m,
+                      content:
+                        'I could not complete the response right now. Please try asking again.'
+                    }
+                  : m
+              )
+            );
+          }
+        },
+        controller.signal
+      );
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         return;
       }
       console.error('Failed to send message:', err);
       setMessages((prev) => [
-        ...prev,
+        ...prev.filter(m => m.id !== tempAssistantMsgId),
         {
           id: `err-${Date.now()}`,
           conversationId: targetConvId || '',
@@ -303,13 +385,87 @@ export const NormalAIContextDrawer: React.FC<NormalAIContextDrawerProps> = ({
                   className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
                 >
                   <div
-                    className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                    className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
                       isUser
                         ? 'bg-zinc-900 text-white rounded-br-xs shadow-xs'
                         : 'bg-zinc-100 text-zinc-900 border border-zinc-200/80 rounded-bl-xs'
                     }`}
                   >
-                    <div className="whitespace-pre-wrap">{msg.content}</div>
+                    {!isUser && msg.reasoningSteps && msg.reasoningSteps.length > 0 && (() => {
+                      const isExpanded = expandedReasoningMsgIds[msg.id] !== undefined
+                        ? expandedReasoningMsgIds[msg.id]
+                        : (isLoading && msg.id === messages[messages.length - 1]?.id);
+                      const hasActiveStep = msg.reasoningSteps.some(s => s.status === 'in_progress');
+                      const activeStep = msg.reasoningSteps.find(s => s.status === 'in_progress') || msg.reasoningSteps[msg.reasoningSteps.length - 1];
+
+                      return (
+                        <div className="mb-2.5 rounded-xl border border-zinc-200 bg-white/90 overflow-hidden text-xs transition-all">
+                          <button
+                            type="button"
+                            onClick={() => toggleReasoning(msg.id)}
+                            className="w-full px-2.5 py-1.5 flex items-center justify-between text-zinc-700 hover:text-zinc-950 transition-colors cursor-pointer text-left"
+                          >
+                            <div className="flex items-center gap-1.5 font-medium min-w-0">
+                              <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                              <span className="truncate text-[11px]">
+                                {isLoading && msg.id === messages[messages.length - 1]?.id && hasActiveStep
+                                  ? (activeStep?.label || 'Deep Researching...')
+                                  : `Deep Research (${msg.reasoningSteps.length})`}
+                              </span>
+                              {isLoading && msg.id === messages[messages.length - 1]?.id && hasActiveStep && (
+                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse shrink-0" />
+                              )}
+                            </div>
+                            <ChevronDown
+                              className={`w-3 h-3 text-zinc-400 transition-transform duration-200 ${
+                                isExpanded ? 'rotate-180' : ''
+                              }`}
+                            />
+                          </button>
+
+                          {isExpanded && (
+                            <div className="px-2.5 pb-2 pt-1 border-t border-zinc-100 space-y-1.5 bg-zinc-50/50">
+                              {msg.reasoningSteps.map((step) => {
+                                const isDone = step.status === 'completed';
+                                const isInProgress = step.status === 'in_progress';
+                                return (
+                                  <div key={step.id} className="flex items-start gap-1.5 text-[10px] leading-relaxed">
+                                    <div className="pt-0.5 shrink-0">
+                                      {isDone ? (
+                                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                      ) : isInProgress ? (
+                                        <Loader2 className="w-3 h-3 text-amber-600 animate-spin" />
+                                      ) : (
+                                        <CircleDashed className="w-3 h-3 text-zinc-300" />
+                                      )}
+                                    </div>
+                                    <span className={isDone ? 'text-zinc-600 font-medium' : isInProgress ? 'text-zinc-900 font-semibold' : 'text-zinc-400'}>
+                                      {step.label}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {!msg.content && !isUser && isLoading && msg.id === messages[messages.length - 1]?.id && (!msg.reasoningSteps || msg.reasoningSteps.length === 0) ? (
+                      <div className="flex items-center gap-1.5 py-0.5 text-zinc-500 text-xs">
+                        <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" />
+                        <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                        <span className="ml-1 text-[11px] font-mono text-zinc-500">Connecting to Sākshi...</span>
+                      </div>
+                    ) : (
+                      <div className="whitespace-pre-wrap">
+                        {msg.content}
+                        {isLoading && msg.id === messages[messages.length - 1]?.id && (
+                          <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-zinc-500 animate-pulse align-middle" />
+                        )}
+                      </div>
+                    )}
 
                     {!isUser && msg.groundingSources && msg.groundingSources.length > 0 && (
                       <div className="mt-2.5 pt-2 border-t border-zinc-200/60">
@@ -371,10 +527,10 @@ export const NormalAIContextDrawer: React.FC<NormalAIContextDrawerProps> = ({
             })
           )}
 
-          {isLoading && (
+          {isLoading && messages.length > 0 && messages[messages.length - 1]?.role === 'user' && (
             <div className="flex items-center gap-2 text-zinc-500 text-xs pl-2">
-              <div className="w-4 h-4 border-2 border-zinc-800 border-t-transparent rounded-full animate-spin" />
-              <span>Sākshi is thinking...</span>
+              <div className="w-3.5 h-3.5 border-2 border-zinc-800 border-t-transparent rounded-full animate-spin" />
+              <span>Connecting to Sākshi...</span>
             </div>
           )}
 
